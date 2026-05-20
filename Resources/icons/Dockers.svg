@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Cookie background -->
+  <rect x="6" y="14" width="52" height="36" fill="#deaa6a" stroke="#5a3a18" stroke-width="2"/>
+  <!-- Cavity outline -->
+  <polygon points="18,18 46,18 38,42 26,42" fill="#5a3a18" opacity="0.85"/>
+  <!-- Docker pins (small dots) -->
+  <circle cx="26" cy="26" r="2.5" fill="#deaa6a"/>
+  <circle cx="38" cy="26" r="2.5" fill="#deaa6a"/>
+  <circle cx="29" cy="34" r="2.5" fill="#deaa6a"/>
+  <circle cx="35" cy="34" r="2.5" fill="#deaa6a"/>
+  <circle cx="32" cy="38" r="2.5" fill="#deaa6a"/>
+</svg>

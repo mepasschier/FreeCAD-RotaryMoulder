@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Cookie background -->
+  <rect x="6" y="14" width="52" height="36" fill="#deaa6a" stroke="#5a3a18" stroke-width="2"/>
+  <!-- Cavity outline -->
+  <polygon points="18,18 46,18 38,42 26,42" fill="#5a3a18" opacity="0.85"/>
+  <!-- Detail: letter "A" engraved in the cavity floor -->
+  <text x="32" y="38" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#deaa6a" text-anchor="middle">A</text>
+</svg>
