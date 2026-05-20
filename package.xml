@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>Rotary Moulder Workbench</name>
+  <description>
+    Design rotary cookie moulder drums for industrial biscuit and cracker
+    production. Wraps flat cookie outlines (via Sketch_On_Surface) onto a
+    cylindrical drum and cuts drafted cavities. Supports engraved/embossed
+    text and shape details, perforation pins (docker pins), and patterning
+    around the drum (linear or alternating layout).
+  </description>
+  <version>1.0.0</version>
+  <date>2026-05-20</date>
+  <maintainer email="hello@mikesprototype.com">Mike Passchier</maintainer>
+  <author email="hello@mikesprototype.com">Mike Passchier</author>
+  <author>Claude.ai (Anthropic)</author>
+  <license file="LICENSE">LGPL-2.1-or-later</license>
+  <url type="repository" branch="main">https://github.com/mepasschier/FreeCAD-RotaryMoulder</url>
+  <url type="readme">https://github.com/mepasschier/FreeCAD-RotaryMoulder/blob/main/README.md</url>
+  <url type="bugtracker">https://github.com/mepasschier/FreeCAD-RotaryMoulder/issues</url>
+  <icon>Resources/icons/RotaryMoulder.svg</icon>
+
+  <content>
+    <workbench>
+      <name>Rotary Moulder</name>
+      <description>
+        Design rotary cookie moulder drums with drafted cavities,
+        text/shape details, docker pins, and pattern replication.
+      </description>
+      <icon>Resources/icons/RotaryMoulder.svg</icon>
+      <classname>RotaryMoulderWorkbench</classname>
+      <subdirectory>./</subdirectory>
+      <tags>
+        <tag>cookie</tag>
+        <tag>biscuit</tag>
+        <tag>cracker</tag>
+        <tag>moulder</tag>
+        <tag>drum</tag>
+        <tag>manufacturing</tag>
+        <tag>food</tag>
+      </tags>
+    </workbench>
+  </content>
+
+  <dependencies>
+    <freecad min="1.0" />
+    <depend type="workbench" optional="false">Curves</depend>
+  </dependencies>
+</package>
