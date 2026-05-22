@@ -1015,21 +1015,34 @@ def build_docker_pins(outline_obj, drum_obj, parent_cavity_floor_radius,
         drum_y = (sy - y_origin) * y_per_y
         # Pin axis direction: outward radial from drum axis at angle theta
         axis_dir = FreeCAD.Vector(math.sin(theta), 0, math.cos(theta))
-        # Base center: on cavity floor surface
+        # Base center: embed slightly BELOW the cavity floor so the cone
+        # base is not exactly tangent to the floor surface. A pin base that
+        # sits exactly at r_floor leaves a tiny degenerate open sliver on
+        # the floor face where it meets tangentially - those slivers make
+        # the floor face fail to tessellate, producing a "hole" in the
+        # exported mesh. Embedding the base 0.1mm into the floor material
+        # makes the pin punch cleanly through, leaving a proper closed
+        # hole. The embedded part is inside solid floor, so it is invisible
+        # and does not change the pin's visible height.
+        _PIN_EMBED = 0.1
+        base_r_embed = r_floor - _PIN_EMBED
         base_center = FreeCAD.Vector(
-            r_floor * math.sin(theta), drum_y,
-            r_floor * math.cos(theta))
+            base_r_embed * math.sin(theta), drum_y,
+            base_r_embed * math.cos(theta))
 
         try:
-            # Build truncated cone (base wider, top narrower)
-            if cone_height > 1e-6:
+            # Build truncated cone (base wider, top narrower). The cone is
+            # taller by _PIN_EMBED so the tip still reaches the same place;
+            # the extra length is buried in the floor.
+            cone_h = cone_height + _PIN_EMBED
+            if cone_h > 1e-6:
                 cone = Part.makeCone(
-                    base_r, tip_r, cone_height,
+                    base_r, tip_r, cone_h,
                     base_center, axis_dir)
             else:
                 cone = None
             # Dome at cone top, fully inside cavity (just below drum surface)
-            dome_center = base_center + axis_dir * cone_height
+            dome_center = base_center + axis_dir * cone_h
             sphere = Part.makeSphere(tip_r, dome_center)
             # Fuse cone + sphere → mushroom-shaped pin
             if cone is not None:
