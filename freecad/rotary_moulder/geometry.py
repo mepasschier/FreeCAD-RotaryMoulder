@@ -33,14 +33,6 @@ import FreeCAD
 import Part
 
 
-# Small radial overlap (mm) used when building detail chunks so their
-# base/top face is never EXACTLY coincident with the cavity floor surface.
-# Coincident faces make OCC's fuse/cut produce broken (negative-volume)
-# solids; a tiny embedded overlap guarantees a clean boolean without
-# changing the visible result.
-_FLOOR_OVERLAP = 0.05
-
-
 # ===========================================================================
 # Debug intermediates - shows construction shapes in tree for diagnostics
 # ===========================================================================
@@ -186,33 +178,10 @@ def _all_closed_wires(shape):
     if shape is None:
         return []
     out = []
-
-    def _already_have(candidate):
-        for existing in out:
-            try:
-                if existing.isSame(candidate):
-                    return True
-            except Exception:
-                pass
-            # Fallback geometric dedupe: same vertex count and near-equal
-            # bounding boxes + length (handles distinct-but-identical refs)
-            try:
-                if (len(existing.Vertexes) == len(candidate.Vertexes)
-                        and abs(existing.Length - candidate.Length) < 1e-6):
-                    eb, cb = existing.BoundBox, candidate.BoundBox
-                    if (abs(eb.XMin - cb.XMin) < 1e-6
-                            and abs(eb.YMin - cb.YMin) < 1e-6
-                            and abs(eb.XMax - cb.XMax) < 1e-6
-                            and abs(eb.YMax - cb.YMax) < 1e-6):
-                        return True
-            except Exception:
-                pass
-        return False
-
     if shape.ShapeType == "Wire" and shape.isClosed():
         out.append(shape)
     for w in getattr(shape, "Wires", []):
-        if w.isClosed() and not _already_have(w):
+        if w.isClosed() and w not in out:
             out.append(w)
     return out
 
@@ -1146,22 +1115,8 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
         r_other = r_floor - depth
         if r_other < 0.5:
             raise ValueError("Engrave depth too close to drum axis")
-        # The engrave chunk is CUT from the cavity floor. Extend its top
-        # slightly ABOVE the floor so its top face isn't exactly coincident
-        # with the cavity floor surface (coincident faces make OCC's
-        # boolean produce broken/negative-volume solids). The overlap sits
-        # in already-empty cavity space, so it doesn't change the result.
-        r_rim_build = r_floor + _FLOOR_OVERLAP
-        r_floor_build = r_other
     else:  # emboss
         r_other = r_floor + depth
-        # The emboss chunk is FUSED onto the cavity floor. Extend its base
-        # slightly BELOW the floor so its bottom face isn't exactly
-        # coincident with the cavity floor surface. The overlap embeds into
-        # the solid floor material, so it doesn't change the visible
-        # result but guarantees a clean fuse.
-        r_rim_build = r_floor - _FLOOR_OVERLAP
-        r_floor_build = r_other
 
     # Projection helper
     def project_to_cyl(p, r):
@@ -1196,7 +1151,7 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
     for face_idx, (outer_w, hole_ws) in enumerate(face_entries):
         # Build the outer chunk: rim from outer_w, floor from offset of outer_w
         outer_chunk = _build_detail_chunk(
-            outer_w, offset_dist, r_rim_build, r_floor_build,
+            outer_w, offset_dist, r_floor, r_other,
             project_to_cyl,
             debug_prefix="det_f{0}_outer".format(face_idx),
         )
@@ -1210,7 +1165,7 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
         # slope the same way as the outer's walls relative to release dir)
         for hole_idx, hw in enumerate(hole_ws):
             hole_chunk = _build_detail_chunk(
-                hw, -offset_dist, r_rim_build, r_floor_build,
+                hw, -offset_dist, r_floor, r_other,
                 project_to_cyl,
                 debug_prefix="det_f{0}_h{1}".format(face_idx, hole_idx),
             )
@@ -1704,96 +1659,52 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
                 "RotaryMoulder: batched detail cut failed: {0}\n"
                 .format(exc))
 
-    # Batch the fuses. Embossed detail chunks (e.g. separate letters) do
-    # NOT touch each other, so the right operation is a SINGLE multiFuse
-    # that includes the base result together with every chunk:
-    #     result.multiFuse([letter1, letter2, ...])
-    # This is more reliable than first merging the letters together and
-    # then fusing onto the base: when non-touching solids are pre-merged,
-    # OCC can silently drop one whose side walls are nearly tangent to a
-    # neighbour's (observed: the 'N' in ZAANDAM disappearing). Fusing all
-    # solids against the base in one operation keeps each one anchored.
-    #
-    # To detect a dropped chunk we count SOLIDS, not volume. A correct
-    # emboss fuse of N separate non-touching chunks onto a single base
-    # solid yields exactly 1 solid (everything connected) - but if a chunk
-    # is dropped the count is unaffected, so instead we compare the fused
-    # result's volume against the simple lower bound: it must be at least
-    # the base volume plus the SMALLEST chunk's volume (i.e. at least one
-    # full chunk's worth beyond base would be missing if one vanished).
-    # This check is only meaningful with multiple chunks; a single chunk
-    # is trusted as-is (its overlap with the base can legitimately make
-    # the net volume gain small, e.g. a broad shallow raised panel).
+    # Batch the fuses too. Same approach: multiFuse into one solid, then
+    # fuse with result in one operation. This avoids successive fuses
+    # degrading the topology of `result`.
     if fuses:
-
-        def _commit(shape):
-            try:
-                return shape.removeSplitter()
-            except Exception:
-                return shape
-
-        fused_ok = False
         try:
-            new_result = result.multiFuse(fuses)
+            if len(fuses) == 1:
+                combined_fuse = fuses[0]
+            else:
+                try:
+                    combined_fuse = fuses[0].multiFuse(fuses[1:])
+                except Exception:
+                    combined_fuse = fuses[0]
+                    for c in fuses[1:]:
+                        combined_fuse = combined_fuse.fuse(c)
+                try:
+                    combined_fuse = combined_fuse.removeSplitter()
+                except Exception:
+                    pass
+            new_result = result.fuse(combined_fuse)
             if new_result is not None and new_result.Volume > 1e-6:
-                if len(fuses) == 1:
-                    # Single chunk: trust it (no neighbour to drop against).
-                    result = _commit(new_result)
-                    fused_ok = True
-                else:
-                    # Multi-chunk: detect a dropped chunk. A dropped chunk
-                    # means a whole chunk's worth of material is missing.
-                    # Use a lenient floor: require the gain to be at least
-                    # the summed chunk volume minus one full smallest chunk
-                    # (covers legitimate floor overlap) but flag larger
-                    # shortfalls. The per-chunk fallback below guarantees
-                    # correctness if this trips, so a false trip is only a
-                    # minor performance cost, never a wrong result.
-                    base_vol = result.Volume if result is not None else 0.0
-                    chunk_vols = [c.Volume for c in fuses]
-                    sum_chunk_vol = sum(chunk_vols)
-                    min_chunk_vol = min(chunk_vols) if chunk_vols else 0.0
-                    gain = new_result.Volume - base_vol
-                    # Flag only if we're short by more than ~one whole chunk.
-                    if gain >= sum_chunk_vol - 0.9 * min_chunk_vol:
-                        result = _commit(new_result)
-                        fused_ok = True
-                    else:
-                        FreeCAD.Console.PrintWarning(
-                            "RotaryMoulder: batched emboss fuse gain "
-                            "{0:.1f} below expected ~{1:.1f}; a detail may "
-                            "have been dropped - retrying per-chunk\n".format(
-                                gain, sum_chunk_vol))
-        except Exception as exc:
-            FreeCAD.Console.PrintWarning(
-                "RotaryMoulder: batched emboss multiFuse failed: {0}\n"
-                .format(exc))
-
-        if not fused_ok:
-            # Per-chunk fallback with verification. Fuse each chunk
-            # individually; if a fuse doesn't increase the volume, retry
-            # that chunk once after a removeSplitter on the running result.
-            for idx, c in enumerate(fuses):
-                before = result.Volume
-                applied = False
-                for attempt in range(2):
+                try:
+                    new_result = new_result.removeSplitter()
+                except Exception:
+                    pass
+                result = new_result
+            else:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: batched detail fuse produced empty "
+                    "result; falling back to per-chunk\n")
+                for c in fuses:
                     try:
                         nr = result.fuse(c)
-                        if nr is not None and nr.Volume > before + 1e-6:
-                            result = _commit(nr)
-                            applied = True
-                            break
+                        if nr is not None and nr.Volume > 1e-6:
+                            try:
+                                nr = nr.removeSplitter()
+                            except Exception:
+                                pass
+                            result = nr
                     except Exception as exc:
                         FreeCAD.Console.PrintWarning(
-                            "RotaryMoulder: detail fuse (chunk {0}, "
-                            "attempt {1}) failed: {2}\n".format(
-                                idx, attempt, exc))
-                    # Clean the running result before retrying
-                    result = _commit(result)
-                if not applied:
-                    FreeCAD.Console.PrintWarning(
-                        "RotaryMoulder: detail chunk {0} could not be "
-                        "fused (likely coincident geometry)\n".format(idx))
+                            "RotaryMoulder: detail fuse failed: {0}\n"
+                            .format(exc))
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: batched detail fuse failed: {0}\n"
+                .format(exc))
     return result
 
 
