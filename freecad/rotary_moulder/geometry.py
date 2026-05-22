@@ -33,6 +33,14 @@ import FreeCAD
 import Part
 
 
+# Small radial overlap (mm) used when building detail chunks so their
+# base/top face is never EXACTLY coincident with the cavity floor surface.
+# Coincident faces make OCC's fuse/cut produce broken (negative-volume)
+# solids; a tiny embedded overlap guarantees a clean boolean without
+# changing the visible result.
+_FLOOR_OVERLAP = 0.05
+
+
 # ===========================================================================
 # Debug intermediates - shows construction shapes in tree for diagnostics
 # ===========================================================================
@@ -1138,8 +1146,22 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
         r_other = r_floor - depth
         if r_other < 0.5:
             raise ValueError("Engrave depth too close to drum axis")
+        # The engrave chunk is CUT from the cavity floor. Extend its top
+        # slightly ABOVE the floor so its top face isn't exactly coincident
+        # with the cavity floor surface (coincident faces make OCC's
+        # boolean produce broken/negative-volume solids). The overlap sits
+        # in already-empty cavity space, so it doesn't change the result.
+        r_rim_build = r_floor + _FLOOR_OVERLAP
+        r_floor_build = r_other
     else:  # emboss
         r_other = r_floor + depth
+        # The emboss chunk is FUSED onto the cavity floor. Extend its base
+        # slightly BELOW the floor so its bottom face isn't exactly
+        # coincident with the cavity floor surface. The overlap embeds into
+        # the solid floor material, so it doesn't change the visible
+        # result but guarantees a clean fuse.
+        r_rim_build = r_floor - _FLOOR_OVERLAP
+        r_floor_build = r_other
 
     # Projection helper
     def project_to_cyl(p, r):
@@ -1174,7 +1196,7 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
     for face_idx, (outer_w, hole_ws) in enumerate(face_entries):
         # Build the outer chunk: rim from outer_w, floor from offset of outer_w
         outer_chunk = _build_detail_chunk(
-            outer_w, offset_dist, r_floor, r_other,
+            outer_w, offset_dist, r_rim_build, r_floor_build,
             project_to_cyl,
             debug_prefix="det_f{0}_outer".format(face_idx),
         )
@@ -1188,7 +1210,7 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
         # slope the same way as the outer's walls relative to release dir)
         for hole_idx, hw in enumerate(hole_ws):
             hole_chunk = _build_detail_chunk(
-                hw, -offset_dist, r_floor, r_other,
+                hw, -offset_dist, r_rim_build, r_floor_build,
                 project_to_cyl,
                 debug_prefix="det_f{0}_h{1}".format(face_idx, hole_idx),
             )
