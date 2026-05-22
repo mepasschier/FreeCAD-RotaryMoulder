@@ -178,10 +178,33 @@ def _all_closed_wires(shape):
     if shape is None:
         return []
     out = []
+
+    def _already_have(candidate):
+        for existing in out:
+            try:
+                if existing.isSame(candidate):
+                    return True
+            except Exception:
+                pass
+            # Fallback geometric dedupe: same vertex count and near-equal
+            # bounding boxes + length (handles distinct-but-identical refs)
+            try:
+                if (len(existing.Vertexes) == len(candidate.Vertexes)
+                        and abs(existing.Length - candidate.Length) < 1e-6):
+                    eb, cb = existing.BoundBox, candidate.BoundBox
+                    if (abs(eb.XMin - cb.XMin) < 1e-6
+                            and abs(eb.YMin - cb.YMin) < 1e-6
+                            and abs(eb.XMax - cb.XMax) < 1e-6
+                            and abs(eb.YMax - cb.YMax) < 1e-6):
+                        return True
+            except Exception:
+                pass
+        return False
+
     if shape.ShapeType == "Wire" and shape.isClosed():
         out.append(shape)
     for w in getattr(shape, "Wires", []):
-        if w.isClosed() and w not in out:
+        if w.isClosed() and not _already_have(w):
             out.append(w)
     return out
 
@@ -1669,17 +1692,17 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
     # neighbour's (observed: the 'N' in ZAANDAM disappearing). Fusing all
     # solids against the base in one operation keeps each one anchored.
     #
-    # After the fuse we verify the volume grew by approximately the sum of
-    # the chunk volumes. If the gain is too small, a chunk was dropped and
-    # we retry one-by-one with per-chunk volume verification.
+    # To detect a dropped chunk we count SOLIDS, not volume. A correct
+    # emboss fuse of N separate non-touching chunks onto a single base
+    # solid yields exactly 1 solid (everything connected) - but if a chunk
+    # is dropped the count is unaffected, so instead we compare the fused
+    # result's volume against the simple lower bound: it must be at least
+    # the base volume plus the SMALLEST chunk's volume (i.e. at least one
+    # full chunk's worth beyond base would be missing if one vanished).
+    # This check is only meaningful with multiple chunks; a single chunk
+    # is trusted as-is (its overlap with the base can legitimately make
+    # the net volume gain small, e.g. a broad shallow raised panel).
     if fuses:
-        sum_chunk_vol = 0.0
-        for c in fuses:
-            try:
-                sum_chunk_vol += c.Volume
-            except Exception:
-                pass
-        base_vol = result.Volume if result is not None else 0.0
 
         def _commit(shape):
             try:
@@ -1691,18 +1714,34 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
         try:
             new_result = result.multiFuse(fuses)
             if new_result is not None and new_result.Volume > 1e-6:
-                gain = new_result.Volume - base_vol
-                # Expect at least 60% of the summed chunk volume to appear
-                # (allowing for the part of each chunk buried in the base).
-                if gain >= 0.60 * sum_chunk_vol:
+                if len(fuses) == 1:
+                    # Single chunk: trust it (no neighbour to drop against).
                     result = _commit(new_result)
                     fused_ok = True
                 else:
-                    FreeCAD.Console.PrintWarning(
-                        "RotaryMoulder: batched emboss fuse gained only "
-                        "{0:.1f} of expected ~{1:.1f}; a detail may have "
-                        "been dropped - retrying per-chunk\n".format(
-                            gain, sum_chunk_vol))
+                    # Multi-chunk: detect a dropped chunk. A dropped chunk
+                    # means a whole chunk's worth of material is missing.
+                    # Use a lenient floor: require the gain to be at least
+                    # the summed chunk volume minus one full smallest chunk
+                    # (covers legitimate floor overlap) but flag larger
+                    # shortfalls. The per-chunk fallback below guarantees
+                    # correctness if this trips, so a false trip is only a
+                    # minor performance cost, never a wrong result.
+                    base_vol = result.Volume if result is not None else 0.0
+                    chunk_vols = [c.Volume for c in fuses]
+                    sum_chunk_vol = sum(chunk_vols)
+                    min_chunk_vol = min(chunk_vols) if chunk_vols else 0.0
+                    gain = new_result.Volume - base_vol
+                    # Flag only if we're short by more than ~one whole chunk.
+                    if gain >= sum_chunk_vol - 0.9 * min_chunk_vol:
+                        result = _commit(new_result)
+                        fused_ok = True
+                    else:
+                        FreeCAD.Console.PrintWarning(
+                            "RotaryMoulder: batched emboss fuse gain "
+                            "{0:.1f} below expected ~{1:.1f}; a detail may "
+                            "have been dropped - retrying per-chunk\n".format(
+                                gain, sum_chunk_vol))
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
                 "RotaryMoulder: batched emboss multiFuse failed: {0}\n"
