@@ -606,27 +606,32 @@ class ToggleDebugCommand:
     cleaner trees - recommended for production use."""
 
     def GetResources(self):
-        state = "ON" if geometry._get_debug_flag() else "OFF"
         return {
             "Pixmap": _icon("Debug.svg"),
-            "MenuText": "Toggle Debug Intermediates ({0})".format(state),
+            "MenuText": "Toggle Debug Intermediates",
             "ToolTip": "Toggle saving intermediate debug shapes during "
-                       "geometry construction (currently {0}). Useful "
-                       "for diagnosing failures; disable for cleaner "
-                       "builds.".format(state),
+                       "geometry construction. Useful for diagnosing "
+                       "failures; disable for cleaner builds. The button "
+                       "stays highlighted/checked while debug mode is ON.",
+            "Checkable": geometry._get_debug_flag(),
         }
 
     def IsActive(self):
         return True
 
-    def Activated(self):
-        # Toggle the flag
-        new_state = not geometry._get_debug_flag()
+    def Activated(self, index=None):
+        # When a command is Checkable, FreeCAD calls Activated(self, index)
+        # with index = the new checked state (1 or 0). When called as a
+        # plain command (no index), fall back to reading+flipping the flag.
+        if index is None:
+            new_state = not geometry._get_debug_flag()
+        else:
+            new_state = bool(index)
         geometry._set_debug_flag(new_state)
         msg = "Debug intermediates: {0}\n".format(
             "ON" if new_state else "OFF")
         FreeCAD.Console.PrintMessage("RotaryMoulder: " + msg)
-        # Show a small status message so user knows it toggled
+        # Show a status-bar message so the user gets immediate feedback
         try:
             FreeCADGui.getMainWindow().statusBar().showMessage(
                 "Rotary Moulder: Debug " + ("ON" if new_state else "OFF"),
