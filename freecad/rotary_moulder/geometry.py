@@ -1659,52 +1659,80 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
                 "RotaryMoulder: batched detail cut failed: {0}\n"
                 .format(exc))
 
-    # Batch the fuses too. Same approach: multiFuse into one solid, then
-    # fuse with result in one operation. This avoids successive fuses
-    # degrading the topology of `result`.
+    # Batch the fuses. Embossed detail chunks (e.g. separate letters) do
+    # NOT touch each other, so the right operation is a SINGLE multiFuse
+    # that includes the base result together with every chunk:
+    #     result.multiFuse([letter1, letter2, ...])
+    # This is more reliable than first merging the letters together and
+    # then fusing onto the base: when non-touching solids are pre-merged,
+    # OCC can silently drop one whose side walls are nearly tangent to a
+    # neighbour's (observed: the 'N' in ZAANDAM disappearing). Fusing all
+    # solids against the base in one operation keeps each one anchored.
+    #
+    # After the fuse we verify the volume grew by approximately the sum of
+    # the chunk volumes. If the gain is too small, a chunk was dropped and
+    # we retry one-by-one with per-chunk volume verification.
     if fuses:
+        sum_chunk_vol = 0.0
+        for c in fuses:
+            try:
+                sum_chunk_vol += c.Volume
+            except Exception:
+                pass
+        base_vol = result.Volume if result is not None else 0.0
+
+        def _commit(shape):
+            try:
+                return shape.removeSplitter()
+            except Exception:
+                return shape
+
+        fused_ok = False
         try:
-            if len(fuses) == 1:
-                combined_fuse = fuses[0]
-            else:
-                try:
-                    combined_fuse = fuses[0].multiFuse(fuses[1:])
-                except Exception:
-                    combined_fuse = fuses[0]
-                    for c in fuses[1:]:
-                        combined_fuse = combined_fuse.fuse(c)
-                try:
-                    combined_fuse = combined_fuse.removeSplitter()
-                except Exception:
-                    pass
-            new_result = result.fuse(combined_fuse)
+            new_result = result.multiFuse(fuses)
             if new_result is not None and new_result.Volume > 1e-6:
-                try:
-                    new_result = new_result.removeSplitter()
-                except Exception:
-                    pass
-                result = new_result
-            else:
-                FreeCAD.Console.PrintWarning(
-                    "RotaryMoulder: batched detail fuse produced empty "
-                    "result; falling back to per-chunk\n")
-                for c in fuses:
-                    try:
-                        nr = result.fuse(c)
-                        if nr is not None and nr.Volume > 1e-6:
-                            try:
-                                nr = nr.removeSplitter()
-                            except Exception:
-                                pass
-                            result = nr
-                    except Exception as exc:
-                        FreeCAD.Console.PrintWarning(
-                            "RotaryMoulder: detail fuse failed: {0}\n"
-                            .format(exc))
+                gain = new_result.Volume - base_vol
+                # Expect at least 60% of the summed chunk volume to appear
+                # (allowing for the part of each chunk buried in the base).
+                if gain >= 0.60 * sum_chunk_vol:
+                    result = _commit(new_result)
+                    fused_ok = True
+                else:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: batched emboss fuse gained only "
+                        "{0:.1f} of expected ~{1:.1f}; a detail may have "
+                        "been dropped - retrying per-chunk\n".format(
+                            gain, sum_chunk_vol))
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
-                "RotaryMoulder: batched detail fuse failed: {0}\n"
+                "RotaryMoulder: batched emboss multiFuse failed: {0}\n"
                 .format(exc))
+
+        if not fused_ok:
+            # Per-chunk fallback with verification. Fuse each chunk
+            # individually; if a fuse doesn't increase the volume, retry
+            # that chunk once after a removeSplitter on the running result.
+            for idx, c in enumerate(fuses):
+                before = result.Volume
+                applied = False
+                for attempt in range(2):
+                    try:
+                        nr = result.fuse(c)
+                        if nr is not None and nr.Volume > before + 1e-6:
+                            result = _commit(nr)
+                            applied = True
+                            break
+                    except Exception as exc:
+                        FreeCAD.Console.PrintWarning(
+                            "RotaryMoulder: detail fuse (chunk {0}, "
+                            "attempt {1}) failed: {2}\n".format(
+                                idx, attempt, exc))
+                    # Clean the running result before retrying
+                    result = _commit(result)
+                if not applied:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: detail chunk {0} could not be "
+                        "fused (likely coincident geometry)\n".format(idx))
     return result
 
 
