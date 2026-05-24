@@ -135,9 +135,9 @@ class AddCavityFromSketchCommand:
         # The rim_narrower option (undercut) is not exposed - it would
         # prevent cookie release.
         direction = "floor_narrower"
-        fillet, ok = QtGui.QInputDialog.getDouble(
-            None, "Fillet radius",
-            "Fillet on cavity floor edges (mm, 0 = none):",
+        chamfer, ok = QtGui.QInputDialog.getDouble(
+            None, "Chamfer distance",
+            "Wall-to-floor chamfer (mm, 0 = none):",
             0.5, 0.0, 20.0, 2,
         )
         if not ok:
@@ -146,7 +146,7 @@ class AddCavityFromSketchCommand:
         geometry.make_cavity(
             drum, outline,
             depth=depth, angle=angle,
-            direction=direction, fillet=fillet,
+            direction=direction, chamfer=chamfer,
         )
 
 
@@ -414,7 +414,7 @@ class PatternCavitiesCommand:
          (with all its details) around the drum. Cavity parameters are
          taken from the source cavity.
       B) Drum + Sketch/Shape: create a new pattern from the outline.
-         Cavity parameters (depth, draft, fillet) are configured in
+         Cavity parameters (depth, draft, chamfer) are configured in
          the dialog.
     """
 
@@ -499,7 +499,7 @@ class PatternCavitiesCommand:
                 depth=params["depth"],
                 angle=params["angle"],
                 direction="floor_narrower",
-                fillet=params["fillet"],
+                chamfer=params["chamfer"],
                 layout=params["layout"],
             )
 
@@ -561,16 +561,16 @@ class _PatternDialog(QtGui.QDialog):
             self.angle.setSuffix(" °")
             layout.addRow("Draft angle:", self.angle)
 
-            self.fillet = QtGui.QDoubleSpinBox()
-            self.fillet.setRange(0.0, 50.0)
-            self.fillet.setDecimals(2)
-            self.fillet.setValue(0.5)
-            self.fillet.setSuffix(" mm")
-            layout.addRow("Fillet radius:", self.fillet)
+            self.chamfer = QtGui.QDoubleSpinBox()
+            self.chamfer.setRange(0.0, 50.0)
+            self.chamfer.setDecimals(2)
+            self.chamfer.setValue(0.5)
+            self.chamfer.setSuffix(" mm")
+            layout.addRow("Chamfer distance:", self.chamfer)
         else:
             self.depth = None
             self.angle = None
-            self.fillet = None
+            self.chamfer = None
 
         btns = QtGui.QDialogButtonBox(
             QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel
@@ -590,7 +590,7 @@ class _PatternDialog(QtGui.QDialog):
         if self.show_cavity_params:
             v["depth"] = self.depth.value()
             v["angle"] = self.angle.value()
-            v["fillet"] = self.fillet.value()
+            v["chamfer"] = self.chamfer.value()
         return v
 
 
