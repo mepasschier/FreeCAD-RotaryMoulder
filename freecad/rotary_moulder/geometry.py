@@ -549,10 +549,336 @@ def _wire_from_3d_points(pts3d):
 
 
 # ===========================================================================
+# Chamfer builder (cavity wall-to-floor chamfer)
+# ===========================================================================
+#
+# Builds a chamfered cavity from the flat sketch outline using a TRUE
+# PERPENDICULAR analytic offset on the unrolled drum surface, projected
+# PER-EDGE so sharp corners are preserved. Three profiles:
+#   rim          (SoS-projected wire)  at R_outer, offset 0
+#   top-of-chamfer                     at R_inner + C, offset C
+#   floor                              at R_inner,     offset depth*tan + C
+# Two lofts (rim->top wall, top->floor chamfer) + caps + sew.
+# A single user value C (ChamferDistance) controls all three. C<=0 falls
+# back to the plain drafted cavity (handled by the caller).
+#
+# offset_outline handles arc edges (radius -/+ d), line edges (parallel
+# inward), generic corner intersection (line/arc), and the single
+# full-circle edge special case.
+
+
+def _chamfer_get_flat_outline(outline_obj):
+    """Return (edges, cx, cy, mapping) for the chamfer builder, or None.
+    edges = ordered edges of the largest closed inner wire of the source
+    sketch; (cx,cy) = centroid; mapping = SoS (theta/x, y/y, x0, y0)."""
+    src = getattr(outline_obj, "Sketch", None)
+    if src is None or not hasattr(src, "Shape"):
+        return None
+    geom = getattr(src, "Geometry", None)
+    if not geom:
+        return None
+    xs = []
+    ys = []
+    for g in geom[:4]:
+        if hasattr(g, "StartPoint") and hasattr(g, "EndPoint"):
+            xs.extend([g.StartPoint.x, g.EndPoint.x])
+            ys.extend([g.StartPoint.y, g.EndPoint.y])
+    if len(xs) < 8 or len(ys) < 8:
+        return None
+    sketch_W = max(xs) - min(xs)
+    sketch_L = max(ys) - min(ys)
+    if sketch_W < 1e-6 or sketch_L < 1e-6:
+        return None
+    flat_ws = [w for w in src.Shape.Wires if w.isClosed()]
+    if not flat_ws:
+        return None
+    flat_ws.sort(key=lambda w: w.BoundBox.DiagonalLength, reverse=True)
+    flat = None
+    for w in flat_ws:
+        bb = w.BoundBox
+        # skip the boundary rectangle (spans ~ full sketch)
+        if bb.XLength > sketch_W * 0.95 and bb.YLength > sketch_L * 0.95:
+            continue
+        flat = w
+        break
+    if flat is None:
+        flat = flat_ws[0]
+    try:
+        edges = flat.OrderedEdges
+    except Exception:
+        edges = list(flat.Edges)
+    if not edges:
+        return None
+    cx = sum(v.Point.x for v in flat.Vertexes) / len(flat.Vertexes)
+    cy = sum(v.Point.y for v in flat.Vertexes) / len(flat.Vertexes)
+    mapping = (2.0 * math.pi / sketch_W, None, min(xs), min(ys))
+    return (edges, cx, cy, sketch_W, sketch_L, min(xs), min(ys))
+
+
+def _cham_is_arc(e):
+    return e.Curve.__class__.__name__ in ("Circle", "ArcOfCircle")
+
+
+def _cham_line_line(p1, d1, p2, d2):
+    x1, y1 = p1; ux, uy = d1; x2, y2 = p2; vx, vy = d2
+    den = ux * vy - uy * vx
+    if abs(den) < 1e-12:
+        return []
+    t = ((x2 - x1) * vy - (y2 - y1) * vx) / den
+    return [(x1 + ux * t, y1 + uy * t)]
+
+
+def _cham_line_circle(p, dl, c, r):
+    px, py = p; ux, uy = dl; cx0, cy0 = c
+    fx = px - cx0; fy = py - cy0
+    a = ux * ux + uy * uy
+    b = 2 * (fx * ux + fy * uy)
+    cc = fx * fx + fy * fy - r * r
+    disc = b * b - 4 * a * cc
+    if disc < 0:
+        return []
+    sq = math.sqrt(disc)
+    return [(px + ux * (-b + sq) / (2 * a), py + uy * (-b + sq) / (2 * a)),
+            (px + ux * (-b - sq) / (2 * a), py + uy * (-b - sq) / (2 * a))]
+
+
+def _cham_circle_circle(c1, r1, c2, r2):
+    dx = c2[0] - c1[0]; dy = c2[1] - c1[1]; dd = math.hypot(dx, dy)
+    if dd < 1e-9 or dd > r1 + r2 + 1e-6 or dd < abs(r1 - r2) - 1e-6:
+        return []
+    a = (r1 * r1 - r2 * r2 + dd * dd) / (2 * dd)
+    h = math.sqrt(max(0, r1 * r1 - a * a))
+    xm = c1[0] + a * dx / dd; ym = c1[1] + a * dy / dd
+    return [(xm + h * dy / dd, ym - h * dx / dd),
+            (xm - h * dy / dd, ym + h * dx / dd)]
+
+
+def _cham_edge_offset(e, d, cx, cy):
+    """Offset primitive for edge e, inset by d toward (cx,cy).
+    arc -> ('arc', center, new_radius); line -> ('line', point, dir)."""
+    if _cham_is_arc(e):
+        c = e.Curve; ctr = c.Center; rad = c.Radius
+        mid = e.valueAt((e.FirstParameter + e.LastParameter) / 2.0)
+        convex = ((cx - ctr.x) * (mid.x - ctr.x) +
+                  (cy - ctr.y) * (mid.y - ctr.y)) < 0
+        nr = rad - d if convex else rad + d
+        return ("arc", (ctr.x, ctr.y), nr)
+    else:
+        p0 = e.Vertexes[0].Point; p1 = e.Vertexes[-1].Point
+        dx = p1.x - p0.x; dy = p1.y - p0.y; L = math.hypot(dx, dy)
+        if L < 1e-9:
+            return ("line", (p0.x, p0.y), (1.0, 0.0))
+        tx = dx / L; ty = dy / L
+        nx, ny = -ty, tx
+        mx = (p0.x + p1.x) / 2; my = (p0.y + p1.y) / 2
+        if (cx - mx) * nx + (cy - my) * ny < 0:
+            nx, ny = -nx, -ny
+        ox = mx + nx * d; oy = my + ny * d
+        return ("line", (ox, oy), (tx, ty))
+
+
+def _cham_intersect(o1, o2):
+    if o1[0] == "line" and o2[0] == "line":
+        return _cham_line_line(o1[1], o1[2], o2[1], o2[2])
+    if o1[0] == "line" and o2[0] == "arc":
+        return _cham_line_circle(o1[1], o1[2], o2[1], o2[2])
+    if o1[0] == "arc" and o2[0] == "line":
+        return _cham_line_circle(o2[1], o2[2], o1[1], o1[2])
+    return _cham_circle_circle(o1[1], o1[2], o2[1], o2[2])
+
+
+def _cham_offset_outline(edges, cx, cy, d):
+    """Analytic perpendicular inward offset of the flat outline by d.
+    Handles arcs, lines, generic corners, and the single full-circle
+    case. Returns a flat Part.Wire."""
+    if abs(d) < 1e-9:
+        return Part.Wire(edges)
+    n = len(edges)
+    # Single full-circle edge: no corners, just shrink the radius.
+    if n == 1 and _cham_is_arc(edges[0]):
+        e = edges[0]; c = e.Curve; ctr = c.Center; rad = c.Radius
+        nr = max(1e-3, rad - d)
+        circ = Part.Circle(FreeCAD.Vector(ctr.x, ctr.y, 0),
+                           FreeCAD.Vector(0, 0, 1), nr)
+        return Part.Wire([circ.toShape()])
+    offs = [_cham_edge_offset(e, d, cx, cy) for e in edges]
+    corners = []
+    for i in range(n):
+        a = offs[i]; b = offs[(i + 1) % n]
+        ev = edges[i].Vertexes[-1].Point
+        ints = _cham_intersect(a, b)
+        corners.append(
+            min(ints, key=lambda p: (p[0] - ev.x) ** 2 + (p[1] - ev.y) ** 2)
+            if ints else (ev.x, ev.y))
+    ne = []
+    for i in range(n):
+        o = offs[i]; s = corners[(i - 1) % n]; en = corners[i]
+        ps = FreeCAD.Vector(s[0], s[1], 0); pe = FreeCAD.Vector(en[0], en[1], 0)
+        if o[0] == "line":
+            ne.append(Part.LineSegment(ps, pe).toShape())
+        else:
+            ctr = o[1]; r = o[2]
+            mid = edges[i].valueAt(
+                (edges[i].FirstParameter + edges[i].LastParameter) / 2.0)
+            md = math.atan2(mid.y - ctr[1], mid.x - ctr[0])
+            pm = FreeCAD.Vector(ctr[0] + r * math.cos(md),
+                                ctr[1] + r * math.sin(md), 0)
+            try:
+                ne.append(Part.ArcOfCircle(ps, pm, pe).toShape())
+            except Exception:
+                ne.append(Part.LineSegment(ps, pe).toShape())
+    return Part.Wire(ne)
+
+
+def _cham_mkring(wire, r, theta_per_x, y_per_y, x_origin, y_origin):
+    """Project a flat offset wire to the drum at radius r, PER-EDGE, so
+    sharp corners are preserved (each edge -> its own BSpline edge)."""
+    def project(p):
+        sx = p.x - x_origin
+        sy = p.y - y_origin
+        th = sx * theta_per_x
+        return FreeCAD.Vector(r * math.sin(th), sy * y_per_y, r * math.cos(th))
+    try:
+        oe = wire.OrderedEdges
+    except Exception:
+        oe = list(wire.Edges)
+    fed = []
+    for e in oe:
+        pts = e.discretize(Number=max(6, int(e.Length * 4)))
+        if e.Orientation == "Reversed":
+            pts = list(reversed(pts))
+        sp = [project(p) for p in pts]
+        cl = [sp[0]]
+        for p in sp[1:]:
+            if (p - cl[-1]).Length > 1e-6:
+                cl.append(p)
+        if len(cl) < 2:
+            continue
+        try:
+            if len(cl) == 2:
+                fed.append(Part.LineSegment(cl[0], cl[1]).toShape())
+            else:
+                bs = Part.BSplineCurve()
+                bs.interpolate(cl)
+                fed.append(bs.toShape())
+        except Exception:
+            fed.append(Part.LineSegment(cl[0], cl[-1]).toShape())
+    return Part.Wire(fed)
+
+
+def _chamfer_frustum_from_projected_wire(
+        rim_wire, outline_obj, drum_obj, R_outer, R_inner, depth,
+        angle_deg, chamfer, debug_prefix="cav"):
+    """Build a CHAMFERED cavity chunk from the rim (SoS) wire plus the
+    flat sketch outline. Three profiles via analytic perpendicular offset,
+    projected per-edge; two lofts; caps via _cyl_cap; sew. Returns the
+    solid, or None to signal the caller should fall back to the plain
+    (non-chamfer) builder."""
+    info = _chamfer_get_flat_outline(outline_obj)
+    if info is None:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer needs a flat sketch outline; "
+            "falling back to plain cavity\n")
+        return None
+    edges, cx, cy, sketch_W, sketch_L, x_origin, y_origin = info
+    theta_per_x = 2.0 * math.pi / sketch_W
+    y_per_y = float(drum_obj.Length) / sketch_L
+
+    tan_d = math.tan(math.radians(angle_deg))
+    # Parametric, draft-preserving construction:
+    #   - The bottom `chamfer` mm of the cavity depth is a 45 deg chamfer:
+    #     it drops `chamfer` radially and insets `chamfer` horizontally.
+    #   - The remaining `(depth - chamfer)` is the drafted wall at the
+    #     configured draft angle (insets (depth-chamfer)*tan(draft)).
+    # This keeps the wall draft = angle_deg and the chamfer = 45 deg for
+    # ANY chamfer value, so ChamferDistance can be edited later without
+    # changing either angle.
+    R_TOPCH = R_inner + chamfer          # where chamfer meets the wall
+    R_FL = R_inner                       # floor
+    h_wall = R_outer - R_TOPCH           # radial height of the drafted wall
+    OFF_TOP = h_wall * tan_d             # wall inset at top-of-chamfer
+    OFF_FL = OFF_TOP + chamfer           # +45 deg chamfer leg to the floor
+
+    # bounds check: chamfer must fit
+    if chamfer <= 0 or chamfer >= depth or R_TOPCH >= R_outer:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer out of range; falling back\n")
+        return None
+
+    try:
+        top_flat = _cham_offset_outline(edges, cx, cy, OFF_TOP)
+        floor_flat = _cham_offset_outline(edges, cx, cy, OFF_FL)
+        P_TOP = _cham_mkring(top_flat, R_TOPCH, theta_per_x, y_per_y,
+                             x_origin, y_origin)
+        P_FL = _cham_mkring(floor_flat, R_FL, theta_per_x, y_per_y,
+                            x_origin, y_origin)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer profile build failed: {0}; "
+            "falling back\n".format(exc))
+        return None
+
+    if not (P_TOP.isClosed() and P_FL.isClosed()):
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer profiles not closed; falling back\n")
+        return None
+
+    _debug_show(rim_wire, debug_prefix + "_rim")
+    _debug_show(P_TOP, debug_prefix + "_topchamfer")
+    _debug_show(P_FL, debug_prefix + "_floor")
+
+    try:
+        wall = Part.makeLoft([rim_wire, P_TOP], False, False, False)
+        cham = Part.makeLoft([P_TOP, P_FL], False, False, False)
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer loft failed: {0}; falling back\n"
+            .format(exc))
+        return None
+
+    top_cap = _cyl_cap(rim_wire, R_outer)
+    bot_cap = _cyl_cap(P_FL, R_FL)
+    if top_cap is None or bot_cap is None:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer cap failed; falling back\n")
+        return None
+
+    all_faces = [top_cap, bot_cap] + list(wall.Faces) + list(cham.Faces)
+    cmp = Part.Compound(all_faces)
+    cmp_sewed = cmp.copy()
+    cmp_sewed.sewShape(0.01)
+    if not cmp_sewed.Shells or not cmp_sewed.Shells[0].isClosed():
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer sew not closed; falling back\n")
+        return None
+    try:
+        solid = Part.Solid(cmp_sewed.Shells[0])
+        if solid.Volume < 0:
+            solid = solid.reversed()
+        try:
+            solid = solid.removeSplitter()
+        except Exception:
+            pass
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: chamfer solid failed: {0}; falling back\n"
+            .format(exc))
+        return None
+    if abs(solid.Volume) < 1e-6:
+        return None
+    _debug_show(solid, debug_prefix + "_solid")
+    FreeCAD.Console.PrintMessage(
+        "RotaryMoulder: chamfer cavity vol={0:.3f} valid={1}\n".format(
+            solid.Volume, solid.isValid()))
+    return solid
+
+
+# ===========================================================================
 # Public entry points
 # ===========================================================================
 
-def build_cavity_solid(outline_obj, drum_obj, depth, angle_deg, direction):
+def build_cavity_solid(outline_obj, drum_obj, depth, angle_deg, direction,
+                       chamfer=0.0):
     _debug_clear()
     if depth <= 0:
         raise ValueError("Cavity depth must be positive")
@@ -586,6 +912,7 @@ def build_cavity_solid(outline_obj, drum_obj, depth, angle_deg, direction):
         return _build_cavity_from_projected_wires(
             projected_wires, drum_obj, R_outer, R_inner,
             depth, offset_dist,
+            outline_obj=outline_obj, angle_deg=angle_deg, chamfer=chamfer,
         )
     else:
         # Non-SoS path: project manually via mapping
@@ -609,10 +936,16 @@ def build_cavity_solid(outline_obj, drum_obj, depth, angle_deg, direction):
 
 
 def _build_cavity_from_projected_wires(projected_wires, drum_obj,
-                                        R_outer, R_inner, depth, offset_dist):
+                                        R_outer, R_inner, depth, offset_dist,
+                                        outline_obj=None, angle_deg=0.0,
+                                        chamfer=0.0):
     """Build cavity solid using already-projected wires (from SoS).
     Each wire is on the drum surface. We loft each to an apex point
-    inside the drum, clip with outer cylinder, subtract inner cylinder."""
+    inside the drum, clip with outer cylinder, subtract inner cylinder.
+
+    If chamfer > 0, the OUTER wire is built with a wall-to-floor chamfer
+    via the analytic-offset chamfer builder; if that fails it falls back
+    to the plain frustum. Holes are always built plain."""
     # Process outer (largest area) + holes
     # For wires on the drum surface, "area" doesn't work directly; sort by
     # 3D bounding box diagonal as a proxy for size.
@@ -626,9 +959,15 @@ def _build_cavity_from_projected_wires(projected_wires, drum_obj,
     outer_wire = sized[0][1]
     hole_wires = [s[1] for s in sized[1:]]
 
-    # Build outer frustum
-    outer_frustum = _frustum_from_projected_wire(
-        outer_wire, R_outer, R_inner, depth, offset_dist)
+    # Build outer frustum (chamfered if requested and possible)
+    outer_frustum = None
+    if chamfer and chamfer > 0 and outline_obj is not None:
+        outer_frustum = _chamfer_frustum_from_projected_wire(
+            outer_wire, outline_obj, drum_obj, R_outer, R_inner,
+            depth, angle_deg, chamfer)
+    if outer_frustum is None:
+        outer_frustum = _frustum_from_projected_wire(
+            outer_wire, R_outer, R_inner, depth, offset_dist)
     if outer_frustum is None:
         raise RuntimeError("Outer frustum construction failed")
 
@@ -1722,22 +2061,13 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
 
 
 def _apply_cavity_with_details(result, drum_obj, cavity_chunk,
-                                cavity_depth, fillet_radius, details_list,
+                                cavity_depth, details_list,
                                 cavity_outline=None, dockers_list=None):
+    # The wall-to-floor chamfer is now baked into the cavity chunk itself
+    # (see build_cavity_solid / _chamfer_frustum_from_projected_wire),
+    # controlled by the cavity's ChamferDistance. The old post-hoc
+    # makeFillet on floor edges has been removed.
     chunk = cavity_chunk
-    if fillet_radius > 0:
-        R_inner = float(drum_obj.Diameter) / 2.0 - cavity_depth
-        floor_edges = []
-        for edge in chunk.Edges:
-            pts = edge.discretize(Number=5)
-            if all(abs(math.hypot(p.x, p.z) - R_inner) < 0.5 for p in pts):
-                floor_edges.append(edge)
-        if floor_edges:
-            try:
-                chunk = chunk.makeFillet(fillet_radius, floor_edges)
-            except Part.OCCError as exc:
-                FreeCAD.Console.PrintWarning(
-                    "RotaryMoulder: fillet failed: {0}\n".format(exc))
     try:
         result = result.cut(chunk)
     except Part.OCCError as exc:
@@ -1851,8 +2181,9 @@ class DraftedCavity:
                         "Cavity", "Direction")
         obj.DraftDirection = ["floor_narrower"]
         obj.DraftDirection = "floor_narrower"
-        obj.addProperty("App::PropertyLength", "FilletRadius", "Cavity",
-                        "Fillet radius on floor edges").FilletRadius = 0.5
+        obj.addProperty("App::PropertyLength", "ChamferDistance", "Cavity",
+                        "Wall-to-floor chamfer distance (0 = no chamfer)"
+                        ).ChamferDistance = 0.5
         obj.addProperty("App::PropertyLinkList", "Details", "Cavity",
                         "Details on this cavity")
         obj.addProperty("App::PropertyLinkList", "Dockers", "Cavity",
@@ -1864,6 +2195,13 @@ class DraftedCavity:
         if not hasattr(obj, "Dockers"):
             obj.addProperty("App::PropertyLinkList", "Dockers", "Cavity",
                             "Docker pin groups on this cavity")
+        if not hasattr(obj, "ChamferDistance"):
+            obj.addProperty("App::PropertyLength", "ChamferDistance",
+                            "Cavity",
+                            "Wall-to-floor chamfer distance (0 = none)")
+            # Migrate the old FilletRadius value if present.
+            old = getattr(obj, "FilletRadius", None)
+            obj.ChamferDistance = float(old) if old is not None else 0.5
 
     def execute(self, obj):
         self._ensure_props(obj)
@@ -1880,6 +2218,7 @@ class DraftedCavity:
                 depth=float(obj.Depth),
                 angle_deg=float(obj.DraftAngle),
                 direction=str(obj.DraftDirection),
+                chamfer=float(getattr(obj, "ChamferDistance", 0.0)),
             )
         except (ValueError, RuntimeError) as exc:
             FreeCAD.Console.PrintError(
@@ -1888,7 +2227,6 @@ class DraftedCavity:
         result = _apply_cavity_with_details(
             drum_shape, obj.Drum, chunk,
             cavity_depth=float(obj.Depth),
-            fillet_radius=float(obj.FilletRadius),
             details_list=list(getattr(obj, "Details", []) or []),
             cavity_outline=obj.Outline,
             dockers_list=list(getattr(obj, "Dockers", []) or []),
@@ -2017,8 +2355,9 @@ class CavityPattern:
                         "Pattern", "Direction")
         obj.DraftDirection = ["floor_narrower"]
         obj.DraftDirection = "floor_narrower"
-        obj.addProperty("App::PropertyLength", "FilletRadius", "Pattern",
-                        "Fillet").FilletRadius = 0.5
+        obj.addProperty("App::PropertyLength", "ChamferDistance", "Pattern",
+                        "Wall-to-floor chamfer distance (0 = none)"
+                        ).ChamferDistance = 0.5
         obj.addProperty("App::PropertyEnumeration", "Layout", "Pattern",
                         "Pattern arrangement style")
         obj.Layout = ["linear", "alternating"]
@@ -2040,6 +2379,12 @@ class CavityPattern:
         if not hasattr(obj, "Dockers"):
             obj.addProperty("App::PropertyLinkList", "Dockers", "Pattern",
                             "Docker pin groups on each patterned cavity")
+        if not hasattr(obj, "ChamferDistance"):
+            obj.addProperty("App::PropertyLength", "ChamferDistance",
+                            "Pattern",
+                            "Wall-to-floor chamfer distance (0 = none)")
+            old = getattr(obj, "FilletRadius", None)
+            obj.ChamferDistance = float(old) if old is not None else 0.5
 
     def execute(self, obj):
         self._ensure_props(obj)
@@ -2053,7 +2398,7 @@ class CavityPattern:
             depth = float(src.Depth)
             angle = float(src.DraftAngle)
             direction = str(src.DraftDirection)
-            fillet = float(src.FilletRadius)
+            chamfer = float(getattr(src, "ChamferDistance", 0.0))
             inherited_details = list(getattr(src, "Details", []) or [])
             inherited_dockers = list(getattr(src, "Dockers", []) or [])
         else:
@@ -2061,7 +2406,7 @@ class CavityPattern:
             depth = float(obj.Depth)
             angle = float(obj.DraftAngle)
             direction = str(obj.DraftDirection)
-            fillet = float(obj.FilletRadius)
+            chamfer = float(getattr(obj, "ChamferDistance", 0.0))
             inherited_details = []
             inherited_dockers = []
 
@@ -2074,6 +2419,7 @@ class CavityPattern:
             base_chunk = build_cavity_solid(
                 outline, obj.Drum,
                 depth=depth, angle_deg=angle, direction=direction,
+                chamfer=chamfer,
             )
         except (ValueError, RuntimeError) as exc:
             FreeCAD.Console.PrintError("RotaryMoulder: {0}\n".format(exc))
@@ -2129,20 +2475,9 @@ class CavityPattern:
         FreeCAD.Console.PrintMessage(
             "RotaryMoulder: pre-building master cavity-with-details\n")
         master = base_chunk
-        # Apply fillet to floor edges of master
-        if fillet > 0:
-            R_inner = R_floor
-            floor_edges = []
-            for edge in master.Edges:
-                pts = edge.discretize(Number=5)
-                if all(abs(math.hypot(p.x, p.z) - R_inner) < 0.5
-                       for p in pts):
-                    floor_edges.append(edge)
-            if floor_edges:
-                try:
-                    master = master.makeFillet(fillet, floor_edges)
-                except Part.OCCError:
-                    pass
+        # The wall-to-floor chamfer is baked into base_chunk via
+        # build_cavity_solid (controlled by ChamferDistance). The old
+        # post-hoc makeFillet on the master's floor edges has been removed.
 
         # Apply details to the master. Details that are EMBOSS bumps add
         # material BACK into the cavity volume; details that are ENGRAVE
@@ -2267,13 +2602,13 @@ def make_drum(doc=None, diameter=100.0, length=200.0, wall=0.0):
 
 
 def make_cavity(drum, outline, depth=3.1, angle=16.0,
-                direction="floor_narrower", fillet=0.5):
+                direction="floor_narrower", chamfer=0.5):
     doc = drum.Document
     obj = doc.addObject("Part::FeaturePython", "Cavity")
     DraftedCavity(obj)
     obj.Drum = drum; obj.Outline = outline; obj.Depth = depth
     obj.DraftAngle = angle; obj.DraftDirection = direction
-    obj.FilletRadius = fillet
+    obj.ChamferDistance = chamfer
     if FreeCAD.GuiUp:
         DraftedCavityViewProvider(obj.ViewObject)
     doc.recompute()
@@ -2320,7 +2655,7 @@ def make_dockers(parent, outline, tip_diameter=0.2, angle=16.0):
 def make_pattern(drum, outline_or_cavity, count_around=6, count_axial=3,
                  spacing=50.0, axial_offset=25.0,
                  depth=3.1, angle=16.0,
-                 direction="floor_narrower", fillet=0.5,
+                 direction="floor_narrower", chamfer=0.5,
                  layout="linear"):
     doc = drum.Document
     obj = doc.addObject("Part::FeaturePython", "CavityPattern")
@@ -2335,7 +2670,7 @@ def make_pattern(drum, outline_or_cavity, count_around=6, count_axial=3,
         obj.Depth = depth
         obj.DraftAngle = angle
         obj.DraftDirection = direction
-        obj.FilletRadius = fillet
+        obj.ChamferDistance = chamfer
     obj.CountAround = count_around
     obj.CountAxial = count_axial
     obj.AxialSpacing = spacing
