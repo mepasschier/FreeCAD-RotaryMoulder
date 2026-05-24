@@ -15,6 +15,8 @@ the drum and along its axis into a full production-ready mould.
 Features:
 
 - **Drafted cavities** — proper release-angle taper, conformal floor
+- **Wall-to-floor chamfer** — parametric `ChamferDistance` for clean
+  dough release; keeps draft and 45° chamfer angles when adjusted
 - **Letter / shape details** — engrave or emboss inside cavities
 - **Docker pins** — perforation pins (e.g. for crackers) with conical
   geometry and rounded tips
