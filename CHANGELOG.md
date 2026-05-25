@@ -3,6 +3,26 @@
 All notable changes to the Rotary Moulder Workbench are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-05-25
+
+### Fixed
+- **Chamfer now works on elliptical cavity outlines.** An ellipse is a
+  single non-circular curve; it was previously mis-handled (treated like
+  a straight segment), distorting the cavity. It is now offset with a
+  true uniform perpendicular offset (sampled along the curve's inward
+  normal), giving a clean drafted wall and chamfer.
+- **Chamfer now works on rounded-rectangle outlines** and any outline
+  with tangent line↔arc junctions (e.g. filleted corners). At a tangent
+  junction the offset wall and the offset fillet are joined at their
+  exact tangent point instead of by intersecting the two offsets, which
+  was numerically unstable and distorted the fillet. Filleted corners
+  now chamfer cleanly, staying tangent to the drafted walls.
+
+### Notes
+- No API or property changes. Scalloped, rectangular (sharp-corner),
+  and circular cavities are unaffected and use the same code paths as
+  v1.1.0.
+
 ## [1.1.0] - 2026-05-24
 
 ### Added
