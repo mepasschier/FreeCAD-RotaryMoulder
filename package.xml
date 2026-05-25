@@ -8,8 +8,8 @@
     text and shape details, perforation pins (docker pins), and patterning
     around the drum (linear or alternating layout).
   </description>
-  <version>1.1.0</version>
-  <date>2026-05-24</date>
+  <version>1.1.1</version>
+  <date>2026-05-25</date>
   <maintainer email="hello@mikesprototype.com">Mike Passchier</maintainer>
   <author email="hello@mikesprototype.com">Mike Passchier</author>
   <author>Claude.ai (Anthropic)</author>
