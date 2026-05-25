@@ -701,15 +701,113 @@ def _cham_offset_outline(edges, cx, cy, d):
         circ = Part.Circle(FreeCAD.Vector(ctr.x, ctr.y, 0),
                            FreeCAD.Vector(0, 0, 1), nr)
         return Part.Wire([circ.toShape()])
+
+    # Single smooth NON-circular closed edge (Ellipse, BSpline, etc.):
+    # an ellipse offset is NOT another ellipse, so we cannot just shrink
+    # axes. Sample the curve, move each point along its inward normal
+    # (toward the cavity center) by d, and rebuild a closed BSpline. This
+    # is a true uniform perpendicular offset that works for any single
+    # smooth curve.
+    if n == 1 and not _cham_is_arc(edges[0]):
+        e = edges[0]
+        try:
+            npts = max(64, int(e.Length))
+            samples = e.discretize(Number=npts)
+            if len(samples) > 1 and (samples[0] - samples[-1]).Length < 1e-7:
+                samples = samples[:-1]
+            crv = e.Curve
+            out = []
+            for p in samples:
+                try:
+                    pr = crv.parameter(p)
+                    tv = crv.tangent(pr)
+                    if isinstance(tv, tuple):
+                        tv = tv[0]
+                    tx, ty = tv.x, tv.y
+                except Exception:
+                    tx, ty = 0.0, 0.0
+                tl = math.hypot(tx, ty)
+                if tl > 1e-9:
+                    tx /= tl; ty /= tl
+                    nx, ny = -ty, tx
+                else:
+                    nx, ny = 0.0, 0.0
+                # orient the normal toward the cavity center (inward)
+                if (cx - p.x) * nx + (cy - p.y) * ny < 0:
+                    nx, ny = -nx, -ny
+                out.append(FreeCAD.Vector(p.x + nx * d, p.y + ny * d, 0))
+            bs = Part.BSplineCurve()
+            bs.interpolate(out, PeriodicFlag=True)
+            w = Part.Wire([bs.toShape()])
+            if w.isClosed():
+                return w
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: smooth-curve offset failed: {0}\n".format(
+                    exc))
+        # fall through to the generic path on failure
+
     offs = [_cham_edge_offset(e, d, cx, cy) for e in edges]
+
+    def _shared_vertex(i, j):
+        """The endpoint shared by edges i and j (robust to orientation)."""
+        ei = edges[i]; ej = edges[j]
+        pts_i = [ei.Vertexes[0].Point, ei.Vertexes[-1].Point]
+        pts_j = [ej.Vertexes[0].Point, ej.Vertexes[-1].Point]
+        best = None; bd = None
+        for pi in pts_i:
+            for pj in pts_j:
+                dd = (pi.x - pj.x) ** 2 + (pi.y - pj.y) ** 2
+                if bd is None or dd < bd:
+                    bd = dd; best = pi
+        return best
+
+    def _tangent_dir_at(e, pt):
+        """Unit tangent of edge e at the endpoint nearest pt."""
+        try:
+            crv = e.Curve
+            pr = crv.parameter(FreeCAD.Vector(pt.x, pt.y, 0))
+            tv = crv.tangent(pr)
+            if isinstance(tv, tuple):
+                tv = tv[0]
+            tx, ty = tv.x, tv.y
+        except Exception:
+            p0 = e.Vertexes[0].Point; p1 = e.Vertexes[-1].Point
+            tx, ty = p1.x - p0.x, p1.y - p0.y
+        L = math.hypot(tx, ty)
+        return (tx / L, ty / L) if L > 1e-12 else (0.0, 0.0)
+
     corners = []
     for i in range(n):
         a = offs[i]; b = offs[(i + 1) % n]
-        ev = edges[i].Vertexes[-1].Point
-        ints = _cham_intersect(a, b)
-        corners.append(
-            min(ints, key=lambda p: (p[0] - ev.x) ** 2 + (p[1] - ev.y) ** 2)
-            if ints else (ev.x, ev.y))
+        j = (i + 1) % n
+        sv = _shared_vertex(i, j)
+        ev = edges[i].Vertexes[-1].Point  # fallback reference point
+
+        # Tangency test at the shared vertex: if the two edges meet
+        # smoothly (e.g. a fillet arc flowing into a rectangle side), the
+        # offset primitives are tangent there and intersecting them is
+        # numerically unstable (produces a bad corner). Instead, the
+        # connection point is the shared vertex moved inward by d along the
+        # common normal toward the cavity center -- the exact tangent point
+        # of the offset arc, which the offset line also touches.
+        ti = _tangent_dir_at(edges[i], sv)
+        tj = _tangent_dir_at(edges[j], sv)
+        cross = abs(ti[0] * tj[1] - ti[1] * tj[0])
+        dot = ti[0] * tj[0] + ti[1] * tj[1]
+        is_tangent = cross < 1e-2 and dot > 0
+
+        if is_tangent:
+            nx, ny = -ti[1], ti[0]
+            if (cx - sv.x) * nx + (cy - sv.y) * ny < 0:
+                nx, ny = -nx, -ny
+            corners.append((sv.x + nx * d, sv.y + ny * d))
+        else:
+            ints = _cham_intersect(a, b)
+            corners.append(
+                min(ints,
+                    key=lambda p: (p[0] - ev.x) ** 2 + (p[1] - ev.y) ** 2)
+                if ints else (ev.x, ev.y))
     ne = []
     for i in range(n):
         o = offs[i]; s = corners[(i - 1) % n]; en = corners[i]
