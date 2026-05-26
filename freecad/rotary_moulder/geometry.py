@@ -1729,12 +1729,38 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
     # Detail radii. Sketch matches at r_floor; the "other" radius depends
     # on mode.
     r_floor = parent_cavity_floor_radius
+    # Embed the rim of a detail slightly past the floor surface so the
+    # chunk OVERLAPS the cavity solid instead of sitting exactly tangent
+    # on the floor. A tangent (coincident) face makes the boolean
+    # unreliable:
+    #   * EMBOSS (fused): a tangent base attaches as a loose shell with a
+    #     visible seam (e.g. a 'Z' not fully joined), and a later boolean
+    #     (docker pins) can drop it entirely. Sink the base INTO the floor
+    #     (r_rim = r_floor - embed) so the bump overlaps solid material.
+    #   * ENGRAVE (cut): a tangent cut top leaves a thin film of material
+    #     across the opening instead of breaking through. Start the cut
+    #     ABOVE the floor (r_rim = r_floor + embed) so the cutter pokes
+    #     out of the floor surface and removes material cleanly down to
+    #     the opening. The part above the floor is in empty cavity space,
+    #     so it removes nothing extra.
+    # The embedded sliver is invisible (buried in solid floor for emboss,
+    # in empty space for engrave) and does not change the visible depth.
+    # This mirrors the docker-pin _PIN_EMBED fix.
+    # Embed is small: just enough to break the exact-tangency that made
+    # the boolean unreliable, but small enough not to perturb complex
+    # glyphs (holes / cut-cut letters) or letters that sit on a raised
+    # panel. 0.02mm is well below visible tolerance.
+    _DETAIL_EMBED = 0.02
+    _ENGRAVE_EMBED = 0.02
+    r_rim = r_floor
     if mode == "engrave":
         r_other = r_floor - depth
         if r_other < 0.5:
             raise ValueError("Engrave depth too close to drum axis")
+        r_rim = r_floor + _ENGRAVE_EMBED  # start cut above the floor
     else:  # emboss
         r_other = r_floor + depth
+        r_rim = r_floor - _DETAIL_EMBED  # sink base into the floor
 
     # Projection helper
     def project_to_cyl(p, r):
@@ -1769,7 +1795,7 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
     for face_idx, (outer_w, hole_ws) in enumerate(face_entries):
         # Build the outer chunk: rim from outer_w, floor from offset of outer_w
         outer_chunk = _build_detail_chunk(
-            outer_w, offset_dist, r_floor, r_other,
+            outer_w, offset_dist, r_rim, r_other,
             project_to_cyl,
             debug_prefix="det_f{0}_outer".format(face_idx),
         )
@@ -1783,7 +1809,7 @@ def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
         # slope the same way as the outer's walls relative to release dir)
         for hole_idx, hw in enumerate(hole_ws):
             hole_chunk = _build_detail_chunk(
-                hw, -offset_dist, r_floor, r_other,
+                hw, -offset_dist, r_rim, r_other,
                 project_to_cyl,
                 debug_prefix="det_f{0}_h{1}".format(face_idx, hole_idx),
             )
@@ -2279,8 +2305,29 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
 
     # Batch the fuses too. Same approach: multiFuse into one solid, then
     # fuse with result in one operation. This avoids successive fuses
-    # degrading the topology of `result`.
+    # degrading the topology of `result`. If the batched fuse fails or
+    # produces a null/empty shape, fall back to fusing each chunk
+    # individually so one bad chunk (e.g. a complex glyph that produced a
+    # malformed solid) does not drop the entire detail.
     if fuses:
+        def _fuse_per_chunk(result_in):
+            r = result_in
+            for c in fuses:
+                try:
+                    nr = r.fuse(c)
+                    if nr is not None and nr.Volume > 1e-6:
+                        try:
+                            nr = nr.removeSplitter()
+                        except Exception:
+                            pass
+                        r = nr
+                except Exception as exc:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: detail fuse failed for one chunk: "
+                        "{0}\n".format(exc))
+            return r
+
+        batched_ok = False
         try:
             if len(fuses) == 1:
                 combined_fuse = fuses[0]
@@ -2302,27 +2349,17 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
                 except Exception:
                     pass
                 result = new_result
-            else:
-                FreeCAD.Console.PrintWarning(
-                    "RotaryMoulder: batched detail fuse produced empty "
-                    "result; falling back to per-chunk\n")
-                for c in fuses:
-                    try:
-                        nr = result.fuse(c)
-                        if nr is not None and nr.Volume > 1e-6:
-                            try:
-                                nr = nr.removeSplitter()
-                            except Exception:
-                                pass
-                            result = nr
-                    except Exception as exc:
-                        FreeCAD.Console.PrintWarning(
-                            "RotaryMoulder: detail fuse failed: {0}\n"
-                            .format(exc))
+                batched_ok = True
         except Exception as exc:
             FreeCAD.Console.PrintWarning(
-                "RotaryMoulder: batched detail fuse failed: {0}\n"
-                .format(exc))
+                "RotaryMoulder: batched detail fuse failed: {0}; "
+                "falling back to per-chunk\n".format(exc))
+
+        if not batched_ok:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: batched detail fuse unusable; "
+                "fusing chunks individually\n")
+            result = _fuse_per_chunk(result)
     return result
 
 
