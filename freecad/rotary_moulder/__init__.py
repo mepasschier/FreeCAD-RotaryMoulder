@@ -3,7 +3,7 @@
 import os
 import FreeCAD
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Find the addon root. This file lives at <addon>/freecad/rotary_moulder/__init__.py
 # so two parents up gets us to the addon root, regardless of whether the
@@ -32,6 +32,8 @@ if FreeCAD.GuiUp:
                 "RotaryMoulder_AddDockers",
                 "RotaryMoulder_ImportShape",
                 "RotaryMoulder_PatternCavities",
+                "RotaryMoulder_AddCuttingCup",
+                "RotaryMoulder_PatternCuttingCups",
                 "RotaryMoulder_ToggleDebug",
             ]
             self.appendToolbar("Rotary Moulder", cmds)
