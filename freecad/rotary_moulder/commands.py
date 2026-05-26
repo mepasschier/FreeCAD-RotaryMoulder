@@ -158,26 +158,30 @@ FreeCADGui.addCommand(
 # ---------------------------------------------------------------------------
 
 def _select_cavity_and_outline():
-    """Return (cavity_or_pattern, outline) from current selection."""
+    """Return (parent, outline) from current selection. The parent may be a
+    DraftedCavity, CavityPattern, or CuttingCup - all of which carry
+    Details and Dockers lists."""
+    _PARENT_TYPES = (
+        "RotaryMoulder::DraftedCavity",
+        "RotaryMoulder::CavityPattern",
+        "RotaryMoulder::CuttingCup",
+    )
     sel = FreeCADGui.Selection.getSelection()
     cavity = None
     outline = None
     for obj in sel:
-        if hasattr(obj, "Proxy") and getattr(obj.Proxy, "Type", "") in (
-                "RotaryMoulder::DraftedCavity",
-                "RotaryMoulder::CavityPattern"):
+        if hasattr(obj, "Proxy") and getattr(obj.Proxy, "Type", "") in \
+                _PARENT_TYPES:
             cavity = obj
         elif hasattr(obj, "Shape"):
             outline = obj
-    # Fallback: if there's only one cavity/pattern in the document
+    # Fallback: if there's only one cavity/pattern/cup in the document
     if cavity is None:
         doc = FreeCAD.ActiveDocument
         if doc is not None:
             cavs = [o for o in doc.Objects
                     if hasattr(o, "Proxy")
-                    and getattr(o.Proxy, "Type", "") in (
-                        "RotaryMoulder::DraftedCavity",
-                        "RotaryMoulder::CavityPattern")]
+                    and getattr(o.Proxy, "Type", "") in _PARENT_TYPES]
             if len(cavs) == 1:
                 cavity = cavs[0]
     return cavity, outline
@@ -189,10 +193,10 @@ class AddDetailCommand:
     def GetResources(self):
         return {
             "Pixmap": _icon("Detail.svg"),
-            "MenuText": "Add Detail to Cavity",
-            "ToolTip": "Select a cavity (or pattern) and a sketch/shape for "
-                       "the detail outline, then run this command to add "
-                       "an engraved or embossed feature.",
+            "MenuText": "Add Detail to Cavity / Cup",
+            "ToolTip": "Select a cavity, pattern, or cutting cup and a "
+                       "sketch/shape for the detail outline, then run this "
+                       "command to add an engraved or embossed feature.",
         }
 
     def IsActive(self):
@@ -203,8 +207,8 @@ class AddDetailCommand:
         if cavity is None:
             QtGui.QMessageBox.warning(
                 None, "Rotary Moulder",
-                "Select a Cavity (or Pattern) together with a sketch/shape "
-                "for the detail outline."
+                "Select a Cavity, Pattern, or Cutting Cup together with a "
+                "sketch/shape for the detail outline."
             )
             return
         if outline is None:
@@ -260,7 +264,7 @@ class AddDockersCommand:
     def GetResources(self):
         return {
             "Pixmap": _icon("Dockers.svg"),
-            "MenuText": "Add Docker Pins to Cavity",
+            "MenuText": "Add Docker Pins to Cavity / Cup",
             "ToolTip": "Select a cavity (or pattern) and a sketch "
                        "containing points/vertices for pin positions. "
                        "Each point becomes one pin going through the "
@@ -275,8 +279,8 @@ class AddDockersCommand:
         if cavity is None:
             QtGui.QMessageBox.warning(
                 None, "Rotary Moulder",
-                "Select a Cavity (or Pattern) together with a sketch "
-                "containing points/vertices for pin positions."
+                "Select a Cavity, Pattern, or Cutting Cup together with a "
+                "sketch containing points/vertices for pin positions."
             )
             return
         if outline is None:
@@ -641,3 +645,237 @@ class ToggleDebugCommand:
 
 
 FreeCADGui.addCommand("RotaryMoulder_ToggleDebug", ToggleDebugCommand())
+
+
+# ---------------------------------------------------------------------------
+
+class AddCuttingCupCommand:
+    """Add a cutting-roll cookie cup to a drum, using the selected sketch
+    as the cookie outline. The cup is a raised body on the drum surface
+    (solid floor + drafted cavity rising to a sharp cutting edge)."""
+
+    def GetResources(self):
+        return {
+            "Pixmap": _icon("CuttingCup.svg"),
+            "MenuText": "Add Cutting Cup From Sketch",
+            "ToolTip": "Select a drum and a sketch (cookie outline), then "
+                       "run this command to build a cutting-roll cookie cup "
+                       "(raised body with a cutting edge) on the drum.",
+        }
+
+    def IsActive(self):
+        return FreeCAD.ActiveDocument is not None
+
+    def Activated(self):
+        drum, outline = _select_drum_and_outline()
+        if drum is None:
+            QtGui.QMessageBox.warning(
+                None, "Rotary Moulder",
+                "No drum found. Create a drum first, then select it together "
+                "with your cookie outline sketch."
+            )
+            return
+        if outline is None:
+            QtGui.QMessageBox.warning(
+                None, "Rotary Moulder",
+                "Select a sketch or shape with a closed wire to use as the "
+                "cookie outline, along with the drum."
+            )
+            return
+
+        dlg = _CuttingCupDialog()
+        if dlg.exec_() != QtGui.QDialog.Accepted:
+            return
+        p = dlg.values()
+        geometry.make_cutting_cup(
+            drum, outline,
+            cookie_thickness=p["cookie_thickness"],
+            floor_thickness=p["floor_thickness"],
+            angle=p["angle"],
+            chamfer=p["chamfer"],
+            crown_flat=p["crown_flat"],
+            fuse_to_drum=p["fuse_to_drum"],
+        )
+
+
+class _CuttingCupDialog(QtGui.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cutting Cup")
+        layout = QtGui.QFormLayout(self)
+
+        self.cookie_thickness = QtGui.QDoubleSpinBox()
+        self.cookie_thickness.setRange(0.1, 100.0)
+        self.cookie_thickness.setDecimals(2)
+        self.cookie_thickness.setValue(3.1)
+        layout.addRow("Cookie thickness (mm):", self.cookie_thickness)
+
+        self.floor_thickness = QtGui.QDoubleSpinBox()
+        self.floor_thickness.setRange(0.0, 100.0)
+        self.floor_thickness.setDecimals(2)
+        self.floor_thickness.setValue(2.0)
+        layout.addRow("Floor thickness (mm):", self.floor_thickness)
+
+        self.angle = QtGui.QDoubleSpinBox()
+        self.angle.setRange(0.0, 60.0)
+        self.angle.setDecimals(2)
+        self.angle.setValue(16.0)
+        layout.addRow("Draft angle (deg):", self.angle)
+
+        self.chamfer = QtGui.QDoubleSpinBox()
+        self.chamfer.setRange(0.0, 20.0)
+        self.chamfer.setDecimals(2)
+        self.chamfer.setValue(0.5)
+        layout.addRow("Inner chamfer (mm, 0=none):", self.chamfer)
+
+        self.crown_flat = QtGui.QDoubleSpinBox()
+        self.crown_flat.setRange(0.0, 10.0)
+        self.crown_flat.setDecimals(3)
+        self.crown_flat.setValue(0.05)
+        layout.addRow("Cutting-edge flat (mm, 0=knife):", self.crown_flat)
+
+        self.fuse_to_drum = QtGui.QCheckBox()
+        self.fuse_to_drum.setChecked(False)
+        layout.addRow("Fuse to drum:", self.fuse_to_drum)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def values(self):
+        return {
+            "cookie_thickness": self.cookie_thickness.value(),
+            "floor_thickness": self.floor_thickness.value(),
+            "angle": self.angle.value(),
+            "chamfer": self.chamfer.value(),
+            "crown_flat": self.crown_flat.value(),
+            "fuse_to_drum": self.fuse_to_drum.isChecked(),
+        }
+
+
+FreeCADGui.addCommand(
+    "RotaryMoulder_AddCuttingCup", AddCuttingCupCommand()
+)
+
+
+# ---------------------------------------------------------------------------
+
+class PatternCuttingCupsCommand:
+    """Pattern a cutting cup around (and along) a drum. Select a drum and
+    an existing CuttingCup to replicate (with its details and dockers)."""
+
+    def GetResources(self):
+        return {
+            "Pixmap": _icon("CuttingCupPattern.svg"),
+            "MenuText": "Pattern Cutting Cups Around Drum",
+            "ToolTip": "Create multiple cutting cups arranged around and "
+                       "along the drum. Select a drum + an existing "
+                       "cutting cup to replicate.",
+        }
+
+    def IsActive(self):
+        return FreeCAD.ActiveDocument is not None
+
+    def Activated(self):
+        sel = FreeCADGui.Selection.getSelection()
+        drum = None
+        source_cup = None
+        for obj in sel:
+            t = getattr(getattr(obj, "Proxy", None), "Type", "")
+            if t == "RotaryMoulder::Drum":
+                drum = obj
+            elif t == "RotaryMoulder::CuttingCup":
+                source_cup = obj
+
+        if drum is None:
+            doc = FreeCAD.ActiveDocument
+            if doc is not None:
+                drums = [o for o in doc.Objects
+                         if getattr(getattr(o, "Proxy", None), "Type", "")
+                         == "RotaryMoulder::Drum"]
+                if len(drums) == 1:
+                    drum = drums[0]
+        if source_cup is None:
+            doc = FreeCAD.ActiveDocument
+            if doc is not None:
+                cups = [o for o in doc.Objects
+                        if getattr(getattr(o, "Proxy", None), "Type", "")
+                        == "RotaryMoulder::CuttingCup"]
+                if len(cups) == 1:
+                    source_cup = cups[0]
+
+        if drum is None or source_cup is None:
+            QtGui.QMessageBox.warning(
+                None, "Rotary Moulder",
+                "Select a drum together with an existing cutting cup to "
+                "replicate around the drum."
+            )
+            return
+
+        dlg = _CupPatternDialog()
+        if dlg.exec_() != QtGui.QDialog.Accepted:
+            return
+        p = dlg.values()
+        geometry.make_cup_pattern(
+            drum, source_cup,
+            count_around=p["count_around"],
+            count_axial=p["count_axial"],
+            spacing=p["spacing"],
+            axial_offset=p["axial_offset"],
+            layout=p["layout"],
+        )
+
+
+class _CupPatternDialog(QtGui.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pattern Cutting Cups")
+        layout = QtGui.QFormLayout(self)
+
+        self.count_around = QtGui.QSpinBox()
+        self.count_around.setRange(1, 200)
+        self.count_around.setValue(6)
+        layout.addRow("Count around drum:", self.count_around)
+
+        self.count_axial = QtGui.QSpinBox()
+        self.count_axial.setRange(1, 200)
+        self.count_axial.setValue(3)
+        layout.addRow("Count along length:", self.count_axial)
+
+        self.spacing = QtGui.QDoubleSpinBox()
+        self.spacing.setRange(0.0, 10000.0)
+        self.spacing.setDecimals(2)
+        self.spacing.setValue(50.0)
+        layout.addRow("Axial spacing (mm):", self.spacing)
+
+        self.axial_offset = QtGui.QDoubleSpinBox()
+        self.axial_offset.setRange(-10000.0, 10000.0)
+        self.axial_offset.setDecimals(2)
+        self.axial_offset.setValue(25.0)
+        layout.addRow("Axial offset from end (mm):", self.axial_offset)
+
+        self.layout_style = QtGui.QComboBox()
+        self.layout_style.addItems(["linear", "alternating"])
+        layout.addRow("Layout:", self.layout_style)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def values(self):
+        return {
+            "count_around": self.count_around.value(),
+            "count_axial": self.count_axial.value(),
+            "spacing": self.spacing.value(),
+            "axial_offset": self.axial_offset.value(),
+            "layout": self.layout_style.currentText(),
+        }
+
+
+FreeCADGui.addCommand(
+    "RotaryMoulder_PatternCuttingCups", PatternCuttingCupsCommand()
+)
