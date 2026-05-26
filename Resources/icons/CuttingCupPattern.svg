@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- drum surface -->
+  <rect x="4" y="40" width="56" height="14" fill="#deaa6a" stroke="#5a3a18" stroke-width="2"/>
+  <!-- three raised cutting cups in a row -->
+  <g stroke="#5a3a18" stroke-width="1.6">
+    <polygon points="8,40 22,40 19,22 11,22" fill="#deaa6a"/>
+    <polygon points="25,40 39,40 36,22 28,22" fill="#deaa6a"/>
+    <polygon points="42,40 56,40 53,22 45,22" fill="#deaa6a"/>
+  </g>
+  <!-- cutting-edge highlights -->
+  <g stroke="#fff" stroke-width="2">
+    <line x1="11" y1="22" x2="19" y2="22"/>
+    <line x1="28" y1="22" x2="36" y2="22"/>
+    <line x1="45" y1="22" x2="53" y2="22"/>
+  </g>
+</svg>

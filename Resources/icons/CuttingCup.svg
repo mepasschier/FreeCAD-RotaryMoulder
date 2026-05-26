@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- drum surface -->
+  <rect x="6" y="34" width="52" height="16" fill="#deaa6a" stroke="#5a3a18" stroke-width="2"/>
+  <!-- raised cookie cup with cutting edge: trapezoid rising from the drum -->
+  <!-- outer drafted wall (wider base, narrowing to the cutting edge) -->
+  <polygon points="16,34 48,34 40,12 24,12" fill="#deaa6a" stroke="#5a3a18" stroke-width="2"/>
+  <!-- inner cavity wall (the cup hollow) -->
+  <polygon points="24,32 40,32 35,16 29,16" fill="#5a3a18" opacity="0.85"/>
+  <!-- cutting edge highlight at the crown -->
+  <line x1="24" y1="12" x2="40" y2="12" stroke="#fff" stroke-width="2.5"/>
+</svg>
