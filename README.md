@@ -21,6 +21,10 @@ Features:
 - **Docker pins** — perforation pins (e.g. for crackers) with conical
   geometry and rounded tips
 - **Patterns** — linear or alternating, with optimized boolean path
+- **Cutting roll cutting cups** — build the cookie as a raised body on
+  the drum with a sharp cutting edge (CuttingCup). Supports details,
+  docker pins, and patterning, with an inner-corner chamfer and an
+  outward-growing cutting-edge flat.
 - **Toggle debug** — view intermediate construction shapes
 
 ## Installation
