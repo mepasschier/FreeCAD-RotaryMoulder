@@ -3,6 +3,23 @@
 All notable changes to the Rotary Moulder Workbench are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-05-26
+
+### Fixed
+- **Detail features now fuse reliably to the cavity/cup floor.** Embossed
+  and engraved details were built exactly tangent to the floor surface,
+  which made the boolean unreliable: an emboss bump could attach as a
+  loose shell with a visible seam (and be dropped by a later docker-pin
+  operation), and an engrave could leave a thin film instead of cutting
+  through. Detail bases now embed a hair (0.02 mm) past the floor so the
+  chunk overlaps cleanly. Visible feature depth is unchanged. This also
+  improves regular moulder cavities, not just cutting cups.
+- **A failed glyph no longer drops a whole word.** When fusing a
+  multi-letter detail, if the combined (batched) fuse failed or produced
+  a null shape, the entire detail was previously discarded. The fuse now
+  falls back to fusing each letter individually, so one problematic glyph
+  is skipped with a warning while the rest of the text is preserved.
+
 ## [1.2.0] - 2026-05-26
 
 ### Added
