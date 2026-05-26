@@ -3,6 +3,37 @@
 All notable changes to the Rotary Moulder Workbench are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-05-26
+
+### Added
+- **Cutting roll cutting cups.** A new `CuttingCup` object builds the
+  whole cookie as a raised body sitting on the drum surface (instead of a
+  cavity cut into the drum), for making cutting rolls. It has a solid
+  floor band on the drum and a drafted cavity above it that rises to a
+  sharp cutting edge following the cookie outline. Properties:
+  `CookieThickness`, `FloorThickness`, `DraftAngle`, `ChamferDistance`
+  (inner cavity-to-floor corner only — the outer cutting wall stays a
+  clean straight draft to the drum), `CrownFlat` (cutting-edge flat width;
+  the flat grows outward so the inner cavity opening always matches the
+  sketch), and `FuseToDrum`.
+- **Cutting cups support Details and Docker pins**, applied on the cup's
+  cavity floor exactly like cavities (the same Add Detail / Add Docker
+  Pins commands now accept a cutting cup as the parent).
+- **`CuttingCupPattern`** replicates a cutting cup (with its details and
+  dockers) around and along the drum, additively (cups are fused, not
+  cut). Honors the source cup's `FuseToDrum` (one fused roll, or separate
+  cup bodies).
+- **Toolbar / menu**: new **Add Cutting Cup From Sketch** and **Pattern
+  Cutting Cups Around Drum** commands, with icons. The existing **Add
+  Detail** and **Add Docker Pins** commands now also work on cutting cups.
+- Cutting cups reuse the chamfer offset machinery, so all supported cavity
+  shapes work: scalloped, rectangular, circular, elliptical, and
+  rounded-rectangle (filleted-corner) outlines.
+
+### Notes
+- No changes to existing cavity / pattern behavior or properties; cutting
+  cups are an additive feature alongside the existing moulder cavities.
+
 ## [1.1.1] - 2026-05-25
 
 ### Fixed
