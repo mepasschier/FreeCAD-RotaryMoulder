@@ -705,9 +705,7 @@ def _cham_offset_outline(edges, cx, cy, d):
     # Single smooth NON-circular closed edge (Ellipse, BSpline, etc.):
     # an ellipse offset is NOT another ellipse, so we cannot just shrink
     # axes. Sample the curve, move each point along its inward normal
-    # (toward the cavity center) by d, and rebuild a closed BSpline. This
-    # is a true uniform perpendicular offset that works for any single
-    # smooth curve.
+    # (toward the cavity center) by d, and rebuild a closed BSpline.
     if n == 1 and not _cham_is_arc(edges[0]):
         e = edges[0]
         try:
@@ -732,7 +730,6 @@ def _cham_offset_outline(edges, cx, cy, d):
                     nx, ny = -ty, tx
                 else:
                     nx, ny = 0.0, 0.0
-                # orient the normal toward the cavity center (inward)
                 if (cx - p.x) * nx + (cy - p.y) * ny < 0:
                     nx, ny = -nx, -ny
                 out.append(FreeCAD.Vector(p.x + nx * d, p.y + ny * d, 0))
@@ -745,25 +742,10 @@ def _cham_offset_outline(edges, cx, cy, d):
             FreeCAD.Console.PrintWarning(
                 "RotaryMoulder: smooth-curve offset failed: {0}\n".format(
                     exc))
-        # fall through to the generic path on failure
 
     offs = [_cham_edge_offset(e, d, cx, cy) for e in edges]
 
-    def _shared_vertex(i, j):
-        """The endpoint shared by edges i and j (robust to orientation)."""
-        ei = edges[i]; ej = edges[j]
-        pts_i = [ei.Vertexes[0].Point, ei.Vertexes[-1].Point]
-        pts_j = [ej.Vertexes[0].Point, ej.Vertexes[-1].Point]
-        best = None; bd = None
-        for pi in pts_i:
-            for pj in pts_j:
-                dd = (pi.x - pj.x) ** 2 + (pi.y - pj.y) ** 2
-                if bd is None or dd < bd:
-                    bd = dd; best = pi
-        return best
-
     def _tangent_dir_at(e, pt):
-        """Unit tangent of edge e at the endpoint nearest pt."""
         try:
             crv = e.Curve
             pr = crv.parameter(FreeCAD.Vector(pt.x, pt.y, 0))
@@ -777,26 +759,33 @@ def _cham_offset_outline(edges, cx, cy, d):
         L = math.hypot(tx, ty)
         return (tx / L, ty / L) if L > 1e-12 else (0.0, 0.0)
 
+    def _shared_vertex(i, j):
+        ei = edges[i]; ej = edges[j]
+        pts_i = [ei.Vertexes[0].Point, ei.Vertexes[-1].Point]
+        pts_j = [ej.Vertexes[0].Point, ej.Vertexes[-1].Point]
+        best = None; bd = None
+        for pi in pts_i:
+            for pj in pts_j:
+                dd = (pi.x - pj.x) ** 2 + (pi.y - pj.y) ** 2
+                if bd is None or dd < bd:
+                    bd = dd; best = pi
+        return best
+
     corners = []
     for i in range(n):
         a = offs[i]; b = offs[(i + 1) % n]
         j = (i + 1) % n
         sv = _shared_vertex(i, j)
-        ev = edges[i].Vertexes[-1].Point  # fallback reference point
-
-        # Tangency test at the shared vertex: if the two edges meet
-        # smoothly (e.g. a fillet arc flowing into a rectangle side), the
-        # offset primitives are tangent there and intersecting them is
-        # numerically unstable (produces a bad corner). Instead, the
-        # connection point is the shared vertex moved inward by d along the
-        # common normal toward the cavity center -- the exact tangent point
-        # of the offset arc, which the offset line also touches.
+        ev = edges[i].Vertexes[-1].Point
+        # Tangent junction (e.g. a fillet arc flowing smoothly into a
+        # rectangle side): the offset primitives are tangent there and
+        # intersecting them is unstable. Use the shared vertex moved inward
+        # by d along the common normal (the exact tangent point).
         ti = _tangent_dir_at(edges[i], sv)
         tj = _tangent_dir_at(edges[j], sv)
         cross = abs(ti[0] * tj[1] - ti[1] * tj[0])
         dot = ti[0] * tj[0] + ti[1] * tj[1]
         is_tangent = cross < 1e-2 and dot > 0
-
         if is_tangent:
             nx, ny = -ti[1], ti[0]
             if (cx - sv.x) * nx + (cy - sv.y) * ny < 0:
@@ -805,8 +794,8 @@ def _cham_offset_outline(edges, cx, cy, d):
         else:
             ints = _cham_intersect(a, b)
             corners.append(
-                min(ints,
-                    key=lambda p: (p[0] - ev.x) ** 2 + (p[1] - ev.y) ** 2)
+                min(ints, key=lambda p: (p[0] - ev.x) ** 2 +
+                    (p[1] - ev.y) ** 2)
                 if ints else (ev.x, ev.y))
     ne = []
     for i in range(n):
@@ -974,6 +963,181 @@ def _chamfer_frustum_from_projected_wire(
 # ===========================================================================
 # Public entry points
 # ===========================================================================
+
+def build_cutting_cup_solid(outline_obj, drum_obj, cookie_thickness,
+                            floor_thickness, angle_deg, chamfer, crown_flat):
+    """Build a CUTTING CUP for a cutting roll: a cup with a SOLID FLOOR
+    band on the drum and a drafted cookie cavity above it, rising to a
+    sharp cutting edge at the cookie outline.
+
+    Cross-section (drum at the bottom, R increasing upward):
+
+                cutting edge / rim (cookie outline, R_edge)
+                       |‾|
+       outer face --> /   \\ <-- inner cavity face
+       (clean        /     \\     (chamfer eases THIS inner corner only)
+        straight    /  ___  \\
+        draft to   /  /   \\  \\
+        the drum) /  /     \\  \\
+        _________/  /       \\  \\________  R_floor_top (top of solid floor)
+        |   SOLID FLOOR BAND (filled)     |
+        |_________________________________|  R_outer (drum surface)
+
+    Radii:
+      R_outer      = drum surface (base of everything)
+      R_floor_top  = R_outer + floor_thickness  (top of the solid floor)
+      R_edge       = R_outer + floor_thickness + cookie_thickness
+                     (the cutting edge / cup rim = the cookie outline)
+
+    Faces:
+      * OUTER wall: from the cutting edge straight-drafted ALL THE WAY down
+        to the drum surface (no chamfer on the outside).
+      * INNER cavity wall: from the cutting edge down to the top of the
+        solid floor, with the wall-to-floor chamfer on the INSIDE only.
+      * Solid floor band between the outer wall base (drum) and is closed
+        by the drum-surface cap; the cavity opens onto the floor top.
+
+    Reuses the chamfer offset+projection machinery, so every cavity shape
+    (scallop, rectangle, circle, ellipse, rounded-rectangle) is supported.
+    """
+    _debug_clear()
+    if cookie_thickness <= 0:
+        raise ValueError("Cookie thickness must be positive")
+    if floor_thickness < 0:
+        raise ValueError("Floor thickness cannot be negative")
+    if not (0 <= angle_deg < 90):
+        raise ValueError("Draft angle must be in [0, 90) degrees")
+    if chamfer < 0:
+        raise ValueError("Chamfer cannot be negative")
+    if crown_flat < 0:
+        raise ValueError("Crown flat cannot be negative")
+
+    R_outer = float(drum_obj.Diameter) / 2.0
+    R_floor_top = R_outer + floor_thickness
+    R_edge = R_outer + floor_thickness + cookie_thickness
+
+    info = _chamfer_get_flat_outline(outline_obj)
+    if info is None:
+        raise ValueError(
+            "Cutting cup needs a Sketch_On_Surface outline with a flat "
+            "sketch (same as the cavity uses).")
+    edges, cx, cy, sketch_W, sketch_L, x_origin, y_origin = info
+    theta_per_x = 2.0 * math.pi / sketch_W
+    y_per_y = float(drum_obj.Length) / sketch_L
+
+    tan_d = math.tan(math.radians(angle_deg))
+    # The cutting-edge flat grows OUTWARD only: the INNER edge stays exactly
+    # on the SoS outline (so the cavity opening at the cutting edge always
+    # matches the sketch, regardless of crown_flat), and the OUTER edge is
+    # the outline offset outward by the full crown_flat.
+
+    def ring(flat, r):
+        return _cham_mkring(flat, r, theta_per_x, y_per_y, x_origin, y_origin)
+
+    # ---- OUTER wall: from the outer cutting edge (outline offset OUT by the
+    # full crown_flat) straight-drafted all the way to the drum (no chamfer).
+    outer_base_off = (R_edge - R_outer) * tan_d + crown_flat
+    try:
+        edge_out_flat = (_cham_offset_outline(edges, cx, cy, -crown_flat)
+                         if crown_flat > 1e-9 else Part.Wire(edges))
+        outer_base_flat = _cham_offset_outline(edges, cx, cy, -outer_base_off)
+    except Exception as exc:
+        raise RuntimeError("Cutting cup outer offset failed: {0}".format(exc))
+    edge_out = ring(edge_out_flat, R_edge)
+    outer_base = ring(outer_base_flat, R_outer)
+
+    # ---- INNER cavity wall: from the inner cutting edge (the SoS outline
+    # itself, offset 0) drafted down to the top of the solid floor, with the
+    # chamfer on the inside. All inner offsets are measured from the outline.
+    use_chamfer = chamfer > 1e-9 and chamfer < cookie_thickness
+    if use_chamfer:
+        R_TOPCH = R_floor_top + chamfer
+        h_inner = R_edge - R_TOPCH
+        inner_top_off = h_inner * tan_d
+        inner_fl_off = inner_top_off + chamfer
+    else:
+        inner_fl_off = (R_edge - R_floor_top) * tan_d
+    try:
+        edge_in_flat = Part.Wire(edges)   # inner edge = the SoS outline
+        inner_fl_flat = _cham_offset_outline(edges, cx, cy, inner_fl_off)
+        if use_chamfer:
+            inner_top_flat = _cham_offset_outline(edges, cx, cy, inner_top_off)
+    except Exception as exc:
+        raise RuntimeError("Cutting cup inner offset failed: {0}".format(exc))
+    edge_in = ring(edge_in_flat, R_edge)
+    inner_fl = ring(inner_fl_flat, R_floor_top)
+    if use_chamfer:
+        inner_top = ring(inner_top_flat, R_TOPCH)
+
+    rings = {"edge_out": edge_out, "outer_base": outer_base,
+             "edge_in": edge_in, "inner_fl": inner_fl}
+    if use_chamfer:
+        rings["inner_top"] = inner_top
+    for nm, w in rings.items():
+        if not w.isClosed():
+            raise RuntimeError(
+                "Cutting cup ring '{0}' is not closed".format(nm))
+        _debug_show(w, "cup_" + nm)
+
+    try:
+        faces = []
+        # Outer wall: edge_out -> outer_base (one straight drafted sweep).
+        faces += list(Part.makeLoft(
+            [edge_out, outer_base], False, False, False).Faces)
+        # Inner cavity wall: edge_in -> [inner_top] -> inner_fl.
+        if use_chamfer:
+            faces += list(Part.makeLoft(
+                [edge_in, inner_top], False, False, False).Faces)
+            faces += list(Part.makeLoft(
+                [inner_top, inner_fl], False, False, False).Faces)
+        else:
+            faces += list(Part.makeLoft(
+                [edge_in, inner_fl], False, False, False).Faces)
+        # Cutting-edge flat between edge_out and edge_in (or knife).
+        if crown_flat > 1e-9:
+            faces += list(Part.makeLoft(
+                [edge_out, edge_in], False, False, False).Faces)
+        # Cavity floor: the cap closing the inner cavity at the floor top
+        # (the dough pocket bottom, on top of the solid floor band).
+        cavity_floor_cap = _cyl_cap(inner_fl, R_floor_top)
+        # Drum-surface cap: closes the bottom of the whole cup (the solid
+        # floor band's underside, bounded by the outer wall base).
+        drum_cap = _cyl_cap(outer_base, R_outer)
+        if cavity_floor_cap is None or drum_cap is None:
+            raise RuntimeError("cap build failed")
+        faces += [cavity_floor_cap, drum_cap]
+    except Exception as exc:
+        raise RuntimeError("Cutting cup loft/cap failed: {0}".format(exc))
+
+    cmp = Part.Compound(faces)
+    cmp_sewed = cmp.copy()
+    cmp_sewed.sewShape(0.01)
+    if not cmp_sewed.Shells or not cmp_sewed.Shells[0].isClosed():
+        cmp_sewed = cmp.copy()
+        cmp_sewed.sewShape(0.1)
+    if not cmp_sewed.Shells or not cmp_sewed.Shells[0].isClosed():
+        raise RuntimeError("Cutting cup sew did not close")
+
+    try:
+        solid = Part.Solid(cmp_sewed.Shells[0])
+        if solid.Volume < 0:
+            solid = solid.reversed()
+        try:
+            solid = solid.removeSplitter()
+        except Exception:
+            pass
+    except Exception as exc:
+        raise RuntimeError("Cutting cup solid build failed: {0}".format(exc))
+
+    if abs(solid.Volume) < 1e-6:
+        raise RuntimeError("Cutting cup has zero volume")
+
+    _debug_show(solid, "cutting_cup_solid")
+    FreeCAD.Console.PrintMessage(
+        "RotaryMoulder: cutting cup vol={0:.3f} valid={1}\n".format(
+            solid.Volume, solid.isValid()))
+    return solid
+
 
 def build_cavity_solid(outline_obj, drum_obj, depth, angle_deg, direction,
                        chamfer=0.0):
@@ -1366,31 +1530,35 @@ def _cyl_cap_via_generalfuse(wire, radius, reverse_normal=False):
 
 
 def build_docker_pins(outline_obj, drum_obj, parent_cavity_floor_radius,
-                       tip_diameter, angle_deg,
-                       parent_cavity_outline=None):
+                      tip_diameter, angle_deg,
+                      parent_cavity_outline=None, pin_height=None):
     """Build docker pin solids from a sketch's vertex/point positions.
 
     Each point in the input sketch becomes one pin. Pins are truncated
     cones with a hemispherical (rounded) tip:
       - Tip diameter = `tip_diameter` (e.g. 0.2mm)
       - Tip is filleted into a hemisphere (radius = tip_diameter/2)
-      - Pin height = cavity depth (tip reaches drum surface level)
+      - Pin height = `pin_height` if given, else cavity depth
+        (R_outer - r_floor) for the in-drum cavity case
       - Base diameter = tip_diameter + 2 * height * tan(draft_angle)
-      - Base sits on cavity floor at parent_cavity_floor_radius
+      - Base sits on the (cavity or cup) floor at parent_cavity_floor_radius
       - Pin axis points OUTWARD (away from drum axis)
+
+    For a CUTTING CUP the floor sits ABOVE the drum surface, so the
+    caller passes pin_height explicitly (= cookie thickness); the pins
+    then rise from the cup floor toward the cutting edge.
 
     Returns a list of (pin_solid, False) tuples (is_hole=False) so it
     can be processed by _apply_detail_chunks with mode='emboss'.
-
-    The sketch's points/vertices are read in flat 2D coords (sketch X,Y)
-    and projected onto the drum surface using the parent cavity's SoS
-    mapping - same mapping used for cavity details.
     """
     R_outer = float(drum_obj.Diameter) / 2.0
     r_floor = parent_cavity_floor_radius
-    depth = R_outer - r_floor
+    if pin_height is not None:
+        depth = float(pin_height)
+    else:
+        depth = R_outer - r_floor
     if depth <= 0:
-        raise ValueError("Cavity floor must be inside drum")
+        raise ValueError("Pin height must be positive")
     if tip_diameter <= 0:
         raise ValueError("Pin tip diameter must be positive")
 
@@ -2224,6 +2392,68 @@ def _apply_cavity_with_details(result, drum_obj, cavity_chunk,
     return result
 
 
+def _apply_cup_with_details(cup_solid, drum_obj, cup_floor_radius,
+                            details_list, cup_outline=None,
+                            dockers_list=None, pin_height=None):
+    """Apply details and docker pins to a CUTTING CUP solid.
+
+    Mirrors _apply_cavity_with_details, but the cup IS the result (we do
+    NOT cut it from the drum first), and the parent floor radius is the
+    cup's cavity-floor-top (R_outer + floor_thickness), which sits ABOVE
+    the drum surface. The detail/docker builders are radius-agnostic, so
+    passing cup_floor_radius makes emboss bumps rise toward the cutting
+    edge and engraves cut into the floor - the same physical behaviour as
+    on a cavity, just on the raised cup floor."""
+    result = cup_solid
+    for det in (details_list or []):
+        if det is None or not hasattr(det, "Proxy"):
+            continue
+        if getattr(det.Proxy, "Type", "") != "RotaryMoulder::CavityDetail":
+            continue
+        if det.Outline is None:
+            continue
+        try:
+            detail_chunks = build_detail_solid(
+                det.Outline, drum_obj,
+                parent_cavity_floor_radius=cup_floor_radius,
+                depth=float(det.Depth),
+                angle_deg=float(det.DraftAngle),
+                direction=str(det.DraftDirection),
+                mode=str(det.Mode),
+                parent_cavity_outline=cup_outline,
+            )
+        except (ValueError, RuntimeError) as exc:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: cup detail '{0}' failed: {1}\n".format(
+                    det.Label, exc))
+            continue
+        result = _apply_detail_chunks(result, detail_chunks, str(det.Mode))
+
+    for dck in (dockers_list or []):
+        if dck is None or not hasattr(dck, "Proxy"):
+            continue
+        if getattr(dck.Proxy, "Type", "") != "RotaryMoulder::CavityDockers":
+            continue
+        if dck.Outline is None:
+            continue
+        try:
+            pin_chunks = build_docker_pins(
+                dck.Outline, drum_obj,
+                parent_cavity_floor_radius=cup_floor_radius,
+                tip_diameter=float(dck.TipDiameter),
+                angle_deg=float(dck.DraftAngle),
+                parent_cavity_outline=cup_outline,
+                pin_height=pin_height,
+            )
+        except (ValueError, RuntimeError) as exc:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: cup dockers '{0}' failed: {1}\n".format(
+                    dck.Label, exc))
+            continue
+        result = _apply_detail_chunks(result, pin_chunks, "emboss")
+    return result
+
+
 # ===========================================================================
 # Document objects
 # ===========================================================================
@@ -2345,6 +2575,127 @@ class DraftedCavityViewProvider:
             if d is not None: kids.append(d)
         for dk in (getattr(obj, "Dockers", []) or []):
             if dk is not None: kids.append(dk)
+        return kids
+    def getIcon(self): return ""
+    def __getstate__(self): return None
+    def __setstate__(self, _state): return None
+
+
+class CuttingCup:
+    """A cutting roll cookie cup: a solid floor band on the drum with a
+    drafted cookie cavity above it, rising to a sharp cutting edge at the
+    cookie outline. Can carry Details (text/shapes) and Docker pins on its
+    cavity floor, and can be a separate body or fused to the drum."""
+    Type = "RotaryMoulder::CuttingCup"
+
+    def __init__(self, obj):
+        obj.addProperty("App::PropertyLink", "Drum", "CuttingCup", "Drum")
+        obj.addProperty("App::PropertyLink", "Outline", "CuttingCup",
+                        "Sketch_On_Surface cookie outline (same as cavity)")
+        obj.addProperty("App::PropertyLength", "CookieThickness",
+                        "CuttingCup",
+                        "Cookie thickness (cavity depth above the floor)"
+                        ).CookieThickness = 3.1
+        obj.addProperty("App::PropertyLength", "FloorThickness",
+                        "CuttingCup",
+                        "Solid floor band thickness on the drum surface"
+                        ).FloorThickness = 2.0
+        obj.addProperty("App::PropertyAngle", "DraftAngle", "CuttingCup",
+                        "Cookie wall draft angle (widens to the drum)"
+                        ).DraftAngle = 16.0
+        obj.addProperty("App::PropertyLength", "ChamferDistance",
+                        "CuttingCup",
+                        "Inner cavity wall-to-floor chamfer "
+                        "(0 = none; outer wall is never chamfered)"
+                        ).ChamferDistance = 0.5
+        obj.addProperty("App::PropertyLength", "CrownFlat", "CuttingCup",
+                        "Flat width at the cutting edge (0 = true knife)"
+                        ).CrownFlat = 0.05
+        obj.addProperty("App::PropertyLinkList", "Details", "CuttingCup",
+                        "Details (text/shapes) on this cup's cavity floor")
+        obj.addProperty("App::PropertyLinkList", "Dockers", "CuttingCup",
+                        "Docker pin groups on this cup's cavity floor")
+        obj.addProperty("App::PropertyBool", "FuseToDrum", "CuttingCup",
+                        "Fuse the cup onto the drum as one solid"
+                        ).FuseToDrum = False
+        obj.Proxy = self
+
+    def _ensure_props(self, obj):
+        if not hasattr(obj, "Details"):
+            obj.addProperty("App::PropertyLinkList", "Details", "CuttingCup",
+                            "Details on this cup's cavity floor")
+        if not hasattr(obj, "Dockers"):
+            obj.addProperty("App::PropertyLinkList", "Dockers", "CuttingCup",
+                            "Docker pin groups on this cup's cavity floor")
+
+    def execute(self, obj):
+        self._ensure_props(obj)
+        if obj.Drum is None or obj.Outline is None:
+            FreeCAD.Console.PrintError(
+                "RotaryMoulder: CuttingCup needs Drum and Outline.\n")
+            return
+        drum_shape = obj.Drum.Shape
+        if drum_shape is None or drum_shape.isNull():
+            return
+        try:
+            cup = build_cutting_cup_solid(
+                obj.Outline, obj.Drum,
+                cookie_thickness=float(obj.CookieThickness),
+                floor_thickness=float(getattr(obj, "FloorThickness", 0.0)),
+                angle_deg=float(obj.DraftAngle),
+                chamfer=float(getattr(obj, "ChamferDistance", 0.0)),
+                crown_flat=float(obj.CrownFlat),
+            )
+        except (ValueError, RuntimeError) as exc:
+            FreeCAD.Console.PrintError(
+                "RotaryMoulder: cutting cup build failed: {0}\n".format(exc))
+            return
+
+        # Apply details + dockers onto the cup's cavity floor (top of the
+        # solid floor band), before any optional fuse to the drum.
+        R_outer = float(obj.Drum.Diameter) / 2.0
+        cup_floor_radius = R_outer + float(getattr(obj, "FloorThickness", 0.0))
+        cup = _apply_cup_with_details(
+            cup, obj.Drum, cup_floor_radius,
+            details_list=list(getattr(obj, "Details", []) or []),
+            cup_outline=obj.Outline,
+            dockers_list=list(getattr(obj, "Dockers", []) or []),
+            pin_height=float(obj.CookieThickness),
+        )
+
+        if bool(getattr(obj, "FuseToDrum", False)):
+            try:
+                fused = drum_shape.fuse(cup)
+                try:
+                    fused = fused.removeSplitter()
+                except Exception:
+                    pass
+                obj.Shape = fused
+            except Exception as exc:
+                FreeCAD.Console.PrintError(
+                    "RotaryMoulder: cutting cup fuse failed: {0}\n".format(
+                        exc))
+                obj.Shape = cup
+        else:
+            obj.Shape = cup
+
+
+class CuttingCupViewProvider:
+    def __init__(self, vobj): vobj.Proxy = self
+    def attach(self, vobj): self.Object = vobj.Object
+    def claimChildren(self):
+        obj = getattr(self, "Object", None)
+        if obj is None:
+            return []
+        kids = []
+        if getattr(obj, "Outline", None):
+            kids.append(obj.Outline)
+        for d in (getattr(obj, "Details", []) or []):
+            if d is not None:
+                kids.append(d)
+        for dk in (getattr(obj, "Dockers", []) or []):
+            if dk is not None:
+                kids.append(dk)
         return kids
     def getIcon(self): return ""
     def __getstate__(self): return None
@@ -2684,6 +3035,159 @@ class CavityPatternViewProvider:
     def __setstate__(self, _state): return None
 
 
+class CuttingCupPattern:
+    """Pattern of CUTTING CUPS around and along the drum, replicating a
+    SourceCup (its geometry, details and dockers). Additive: each cup is
+    built once as a master, copied to every position, and the copies are
+    fused together. If the source cup's FuseToDrum is set, the whole roll
+    is fused onto the drum; otherwise the cups form a separate compound
+    body resting on the drum."""
+    Type = "RotaryMoulder::CuttingCupPattern"
+
+    def __init__(self, obj):
+        obj.addProperty("App::PropertyLink", "Drum", "Pattern", "Drum")
+        obj.addProperty("App::PropertyLink", "SourceCup", "Pattern",
+                        "Replicate this CuttingCup")
+        obj.addProperty("App::PropertyInteger", "CountAround", "Pattern",
+                        "Cups around the drum").CountAround = 6
+        obj.addProperty("App::PropertyInteger", "CountAxial", "Pattern",
+                        "Cups along the drum length").CountAxial = 3
+        obj.addProperty("App::PropertyLength", "AxialSpacing", "Pattern",
+                        "Spacing").AxialSpacing = 50.0
+        obj.addProperty("App::PropertyDistance", "AxialOffset", "Pattern",
+                        "Offset from end").AxialOffset = 25.0
+        obj.addProperty("App::PropertyEnumeration", "Layout", "Pattern",
+                        "Pattern arrangement style")
+        obj.Layout = ["linear", "alternating"]
+        obj.Layout = "linear"
+        obj.Proxy = self
+
+    def execute(self, obj):
+        if obj.Drum is None:
+            return
+        drum_obj = obj.Drum
+        drum_shape = drum_obj.Shape
+        if drum_shape is None or drum_shape.isNull():
+            return
+
+        src = getattr(obj, "SourceCup", None)
+        if src is None or not hasattr(src, "Proxy") or \
+                getattr(src.Proxy, "Type", "") != "RotaryMoulder::CuttingCup":
+            FreeCAD.Console.PrintError(
+                "RotaryMoulder: CuttingCupPattern needs a SourceCup.\n")
+            return
+        if src.Outline is None:
+            FreeCAD.Console.PrintError(
+                "RotaryMoulder: SourceCup has no Outline.\n")
+            return
+
+        # Build ONE master cup (with details + dockers) at origin.
+        try:
+            master = build_cutting_cup_solid(
+                src.Outline, drum_obj,
+                cookie_thickness=float(src.CookieThickness),
+                floor_thickness=float(getattr(src, "FloorThickness", 0.0)),
+                angle_deg=float(src.DraftAngle),
+                chamfer=float(getattr(src, "ChamferDistance", 0.0)),
+                crown_flat=float(src.CrownFlat),
+            )
+        except (ValueError, RuntimeError) as exc:
+            FreeCAD.Console.PrintError(
+                "RotaryMoulder: cup pattern master build failed: {0}\n"
+                .format(exc))
+            return
+
+        R_outer = float(drum_obj.Diameter) / 2.0
+        cup_floor_radius = R_outer + float(getattr(src, "FloorThickness", 0.0))
+        master = _apply_cup_with_details(
+            master, drum_obj, cup_floor_radius,
+            details_list=list(getattr(src, "Details", []) or []),
+            cup_outline=src.Outline,
+            dockers_list=list(getattr(src, "Dockers", []) or []),
+            pin_height=float(src.CookieThickness),
+        )
+
+        count_a = max(1, int(obj.CountAround))
+        count_x = max(1, int(obj.CountAxial))
+        spacing = float(obj.AxialSpacing)
+        offset = float(obj.AxialOffset)
+        layout = str(getattr(obj, "Layout", "linear"))
+        angular_step = 360.0 / count_a
+        half_step = angular_step / 2.0
+
+        FreeCAD.Console.PrintMessage(
+            "RotaryMoulder: placing cup master at {0} positions\n".format(
+                count_a * count_x))
+
+        placed = []
+        for i in range(count_x):
+            y = offset + i * spacing
+            row_offset = (half_step if (layout == "alternating" and i % 2 == 1)
+                          else 0.0)
+            for j in range(count_a):
+                rot_angle = angular_step * j + row_offset
+                pl = FreeCAD.Placement()
+                pl.Rotation = FreeCAD.Rotation(
+                    FreeCAD.Vector(0, 1, 0), rot_angle)
+                pl.Base = FreeCAD.Vector(0, y, 0)
+                cup_copy = master.copy()
+                cup_copy.Placement = pl.multiply(cup_copy.Placement)
+                placed.append(cup_copy)
+
+        if not placed:
+            return
+
+        fuse_to_drum = bool(getattr(src, "FuseToDrum", False))
+        if fuse_to_drum:
+            # One fused solid: drum + all cups.
+            result = drum_shape.copy()
+            try:
+                result = result.multiFuse(placed)
+                try:
+                    result = result.removeSplitter()
+                except Exception:
+                    pass
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: cup pattern fuse-to-drum failed: {0}; "
+                    "falling back to per-cup fuse\n".format(exc))
+                result = drum_shape.copy()
+                for c in placed:
+                    try:
+                        result = result.fuse(c)
+                    except Exception:
+                        pass
+                try:
+                    result = result.removeSplitter()
+                except Exception:
+                    pass
+            obj.Shape = result
+        else:
+            # Separate cups: a compound of all cup bodies (drum stays its
+            # own object). Fuse the cups to each other only where they
+            # overlap; otherwise a compound keeps them as distinct solids.
+            try:
+                obj.Shape = Part.Compound(placed)
+            except Exception as exc:
+                FreeCAD.Console.PrintError(
+                    "RotaryMoulder: cup pattern compound failed: {0}\n"
+                    .format(exc))
+
+
+class CuttingCupPatternViewProvider:
+    def __init__(self, vobj): vobj.Proxy = self
+    def attach(self, vobj): self.Object = vobj.Object
+    def claimChildren(self):
+        obj = getattr(self, "Object", None)
+        if obj is None:
+            return []
+        return ([obj.SourceCup] if getattr(obj, "SourceCup", None)
+                else [])
+    def getIcon(self): return ""
+    def __getstate__(self): return None
+    def __setstate__(self, _state): return None
+
+
 # ===========================================================================
 # Factories
 # ===========================================================================
@@ -2713,12 +3217,43 @@ def make_cavity(drum, outline, depth=3.1, angle=16.0,
     return obj
 
 
+def make_cutting_cup(drum, outline, cookie_thickness=3.1, floor_thickness=2.0,
+                     angle=16.0, chamfer=0.5, crown_flat=0.05,
+                     fuse_to_drum=False):
+    """Create a CuttingCup (cutting-roll cookie cup) on the drum, following
+    the same Sketch_On_Surface cookie outline a cavity would use. A solid
+    floor band of floor_thickness sits on the drum; the drafted cookie
+    cavity rises above it by cookie_thickness to a sharp cutting edge.
+    The outer wall is a clean straight draft to the drum; the chamfer (if
+    any) eases only the inner cavity-to-floor corner."""
+    doc = drum.Document
+    obj = doc.addObject("Part::FeaturePython", "CuttingCup")
+    CuttingCup(obj)
+    obj.Drum = drum
+    obj.Outline = outline
+    obj.CookieThickness = cookie_thickness
+    obj.FloorThickness = floor_thickness
+    obj.DraftAngle = angle
+    obj.ChamferDistance = chamfer
+    obj.CrownFlat = crown_flat
+    obj.FuseToDrum = fuse_to_drum
+    if FreeCAD.GuiUp:
+        CuttingCupViewProvider(obj.ViewObject)
+    doc.recompute()
+    return obj
+
+
 def make_detail(parent, outline, depth=1.0, angle=10.0,
                 direction="floor_narrower", mode="engrave"):
     doc = parent.Document
     obj = doc.addObject("Part::FeaturePython", "CavityDetail")
     CavityDetail(obj)
-    obj.Cavity = parent
+    # NOTE: we intentionally do NOT set obj.Cavity = parent. That back-link
+    # is never read for computation and, combined with the parent's forward
+    # Details link, creates a dependency CYCLE that FreeCAD rejects ("graph
+    # must be a DAG") - which silently prevents the parent (e.g. a
+    # CuttingCup) from applying its details. The parent forward-links the
+    # detail via its Details list, which is all that's needed.
     obj.Outline = outline; obj.Depth = depth
     obj.DraftAngle = angle; obj.DraftDirection = direction; obj.Mode = mode
     if FreeCAD.GuiUp:
@@ -2731,13 +3266,14 @@ def make_detail(parent, outline, depth=1.0, angle=10.0,
 
 
 def make_dockers(parent, outline, tip_diameter=0.2, angle=16.0):
-    """Add a CavityDockers (docker pins) child to a Cavity or
+    """Add a CavityDockers (docker pins) child to a Cavity, CuttingCup or
     CavityPattern. `outline` is a sketch/shape whose vertices/points
     define where pins go."""
     doc = parent.Document
     obj = doc.addObject("Part::FeaturePython", "CavityDockers")
     CavityDockers(obj)
-    obj.Cavity = parent
+    # See make_detail: do NOT set obj.Cavity (cyclic dependency). The parent
+    # forward-links via its Dockers list, which is what drives the build.
     obj.Outline = outline
     obj.TipDiameter = tip_diameter
     obj.DraftAngle = angle
@@ -2776,5 +3312,26 @@ def make_pattern(drum, outline_or_cavity, count_around=6, count_axial=3,
     obj.Layout = layout
     if FreeCAD.GuiUp:
         CavityPatternViewProvider(obj.ViewObject)
+    doc.recompute()
+    return obj
+
+
+def make_cup_pattern(drum, source_cup, count_around=6, count_axial=3,
+                     spacing=50.0, axial_offset=25.0, layout="linear"):
+    """Create a CuttingCupPattern that replicates source_cup (a CuttingCup,
+    with its details and dockers) around and along the drum. Whether the
+    result is fused onto the drum follows the source cup's FuseToDrum."""
+    doc = drum.Document
+    obj = doc.addObject("Part::FeaturePython", "CuttingCupPattern")
+    CuttingCupPattern(obj)
+    obj.Drum = drum
+    obj.SourceCup = source_cup
+    obj.CountAround = count_around
+    obj.CountAxial = count_axial
+    obj.AxialSpacing = spacing
+    obj.AxialOffset = axial_offset
+    obj.Layout = layout
+    if FreeCAD.GuiUp:
+        CuttingCupPatternViewProvider(obj.ViewObject)
     doc.recompute()
     return obj
