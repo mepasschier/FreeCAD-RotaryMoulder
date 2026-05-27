@@ -1529,6 +1529,384 @@ def _cyl_cap_via_generalfuse(wire, radius, reverse_normal=False):
         return None
 
 
+def build_roster_bars(outline_obj, drum_obj, parent_cavity_floor_radius,
+                      bar_width, depth, angle_deg, mode,
+                      parent_cavity_outline=None, pin_height=None,
+                      floor_inset=None):
+    """Build a roster / lattice detail from a CENTERLINE sketch.
+
+    Each edge of the outline sketch is a bar centerline. A trapezoidal
+    cross-section (base width = `bar_width` at the floor, narrowing toward
+    the top by the draft angle, height = `depth`) is built along each
+    centerline as a series of cylinder-conformal profiles, then lofted
+    into a bar solid. All bars are returned as (solid, False) chunks so
+    they are applied exactly like other details:
+      * emboss -> bars rise OUTWARD from the floor (fused to the body)
+      * engrave -> bars are cut INWARD into the floor (recessed grooves)
+
+    Unlike build_detail_solid (which needs closed faces), this works from
+    open centerlines - the natural way to draw a grid/roster. Crossing
+    bars overlap and merge when the chunks are fused.
+
+    The base of each bar lies on the floor cylinder and the top on a
+    concentric cylinder (floor +/- depth), so every bar's faces are
+    patches of the SAME two cylinders - bars blend cleanly at crossings
+    regardless of orientation, with no sweep twist.
+
+    parent_cavity_floor_radius: radius the bars sit on (cavity floor, or
+        cutting-cup floor top).
+    pin_height: optional explicit height for the floor->edge span when the
+        floor sits ABOVE the drum (cutting cup). Not needed for emboss/
+        engrave depth (that is `depth`); kept for signature symmetry.
+    """
+    if bar_width <= 0:
+        raise ValueError("Roster bar width must be positive")
+    if depth <= 0:
+        raise ValueError("Roster depth must be positive")
+    if not (0 <= angle_deg < 90):
+        raise ValueError("Roster draft angle must be in [0, 90) degrees")
+    if mode not in ("engrave", "emboss"):
+        raise ValueError("Roster mode must be 'engrave' or 'emboss'")
+
+    if parent_cavity_outline is None:
+        raise ValueError(
+            "Roster requires a parent_cavity_outline for placement.")
+    mapping = _get_sos_mapping(parent_cavity_outline, drum_obj)
+    if mapping is None:
+        raise ValueError(
+            "Could not derive SoS mapping from parent cavity outline.")
+    theta_per_x, y_per_y, x_origin, y_origin = mapping
+
+    r_floor = parent_cavity_floor_radius
+    # Embed the base of each bar slightly past the floor so the bar
+    # OVERLAPS the body instead of sitting exactly tangent on the floor
+    # surface. A tangent base makes the boolean unreliable - the bars
+    # attach as loose shells and the fuse drops all but one. This mirrors
+    # the detail-emboss _DETAIL_EMBED fix.
+    _ROSTER_EMBED = 0.2
+    if mode == "emboss":
+        r_base = r_floor - _ROSTER_EMBED   # sink base into the floor
+        r_top = r_floor + depth            # bars rise outward
+    else:                                   # engrave
+        r_base = r_floor + _ROSTER_EMBED   # start cut above the floor
+        r_top = r_floor - depth            # grooves cut inward
+        if r_top < 0.5:
+            raise ValueError("Roster engrave depth too close to drum axis")
+
+    def project(x, y, r):
+        sx = x - x_origin
+        sy = y - y_origin
+        th = sx * theta_per_x
+        return FreeCAD.Vector(r * math.sin(th), sy * y_per_y,
+                              r * math.cos(th))
+
+    tan_d = math.tan(math.radians(angle_deg))
+    hw = bar_width / 2.0
+    # Top half-width: narrower than base by depth*tan(draft) for release.
+    top_hw = max(0.05, hw - depth * tan_d)
+
+    # Gather centerline edges. A roster sketch is centerlines; if the
+    # sketch also contains a closed boundary wire (the panel outline),
+    # drop the longest closed wire so only the bars remain.
+    shape = getattr(outline_obj, "Shape", None)
+    if hasattr(outline_obj, "Sketch") and outline_obj.Sketch is not None:
+        shape = outline_obj.Sketch.Shape
+    if shape is None or not shape.Edges:
+        raise ValueError("Roster outline has no edges.")
+    edges = list(shape.Edges)
+    closed_wires = [w for w in shape.Wires if w.isClosed()]
+    if closed_wires:
+        boundary = max(closed_wires, key=lambda w: w.Length)
+        # Only drop it if there are other edges besides the boundary.
+        bids = set(id(e) for e in boundary.Edges)
+        kept = [e for e in edges if id(e) not in bids]
+        if kept:
+            edges = kept
+            FreeCAD.Console.PrintMessage(
+                "RotaryMoulder: roster dropped boundary wire "
+                "(len={0:.1f}); {1} bar edge(s) remain\n".format(
+                    boundary.Length, len(edges)))
+
+    FreeCAD.Console.PrintMessage(
+        "RotaryMoulder: building roster with {0} bar(s), "
+        "width={1:.2f}, depth={2:.2f}, mode={3}\n".format(
+            len(edges), bar_width, depth, mode))
+
+    def planar_profile(P, Pnext):
+        """Trapezoid profile built in the LOCAL plane perpendicular to the
+        path at point P, spanned by the radial direction (height) and the
+        width direction (across the bar, tangent to the surface). The
+        profile is PLANAR (all four corners coplanar), which is essential:
+        a profile whose corners are individually projected onto the
+        cylinder is NON-planar, and lofting non-planar profiles produces
+        an INVALID solid that corrupts later booleans (the fuse can
+        destroy the whole body). A planar profile lofts into a valid bar.
+
+        Base sunk by the embed (inward), top raised by depth (outward for
+        emboss; the caller sets HEIGHT_SIGN via r_top vs r_floor through
+        the rad multipliers below).
+        """
+        rad = FreeCAD.Vector(P.x, 0, P.z)
+        if rad.Length < 1e-9:
+            return None
+        rad.normalize()
+        tan = Pnext.sub(P)
+        if tan.Length < 1e-9:
+            return None
+        tan.normalize()
+        wdir = tan.cross(rad)
+        if wdir.Length < 1e-9:
+            return None
+        wdir.normalize()
+        # Base on the floor (sunk inward by the embed), top at +/- depth.
+        # height_dir is +rad for emboss (rise outward), -rad for engrave.
+        base = P + rad * (r_base - r_floor)        # r_base = floor -/+ embed
+        top = P + rad * (r_top - r_floor)          # r_top  = floor +/- depth
+        b1 = base + wdir * hw
+        b2 = base - wdir * hw
+        t1 = top + wdir * top_hw
+        t2 = top - wdir * top_hw
+        return Part.Wire(Part.makePolygon([b1, b2, t2, t1, b1]))
+
+    bars = []
+    for ei, e in enumerate(edges):
+        try:
+            n = max(2, int(e.Length * 2))
+            raw = e.discretize(Number=n)
+            # path points ON the floor surface (projected centerline)
+            pts = [project(p.x, p.y, r_floor) for p in raw]
+            if len(pts) < 2:
+                continue
+            profs = []
+            for k in range(len(pts)):
+                if k + 1 < len(pts):
+                    Pn = pts[k + 1]
+                else:
+                    Pn = pts[k] + (pts[k] - pts[k - 1])
+                pr = planar_profile(pts[k], Pn)
+                if pr is not None:
+                    profs.append(pr)
+            if len(profs) < 2:
+                continue
+            # Loft the SIDE walls as a shell (not solid). makeLoft with
+            # solid=True often fails to cap the ends here, leaving an open
+            # 4-face shell (no front/back) that is not a valid solid and
+            # corrupts later booleans. So we build the side shell, then
+            # ADD explicit end-cap faces from the first and last planar
+            # profile wires, sew all faces, and build the solid - giving a
+            # proper closed 6-face bar.
+            try:
+                side = Part.makeLoft(profs, False, True, False)
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster bar {0} side loft failed: "
+                    "{1}\n".format(ei, exc))
+                continue
+            try:
+                cap_start = Part.Face(profs[0])
+                cap_end = Part.Face(profs[-1])
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster bar {0} cap failed: {1}\n".format(
+                        ei, exc))
+                continue
+            faces = list(side.Faces) + [cap_start, cap_end]
+            try:
+                shell_cmp = Part.Compound(faces).copy()
+                shell_cmp.sewShape(0.01)
+                if not shell_cmp.Shells:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: roster bar {0} did not sew into a "
+                        "shell\n".format(ei))
+                    continue
+                bar = Part.Solid(shell_cmp.Shells[0])
+            except Exception as exc:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster bar {0} solid build failed: "
+                    "{1}\n".format(ei, exc))
+                continue
+            if bar is None or abs(bar.Volume) < 1e-6:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster bar {0} empty\n".format(ei))
+                continue
+            if bar.Volume < 0:
+                try:
+                    bar = bar.reversed()
+                except Exception:
+                    pass
+            try:
+                bar = bar.removeSplitter()
+            except Exception:
+                pass
+            if not bar.isValid():
+                try:
+                    fixed = bar.copy()
+                    fixed.fix(1e-6, 1e-6, 1e-6)
+                    if fixed.isValid() and abs(fixed.Volume) > 1e-6:
+                        bar = fixed
+                except Exception:
+                    pass
+            if not bar.isValid():
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster bar {0} invalid after heal; "
+                    "skipping (would corrupt fuse)\n".format(ei))
+                continue
+            bars.append((bar, False))
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: roster bar {0} failed: {1}\n".format(
+                    ei, exc))
+
+    if not bars:
+        raise RuntimeError("No roster bars could be built")
+
+    # --- Optional clip to the flat-floor footprint ---
+    # Bars run the full length of their centerlines, so a bar reaching the
+    # edge of the floor would extend UNDER the cup/cavity wall (an engrave
+    # then tunnels a cavity beneath the wall). When floor_inset is given,
+    # clip every engraved bar to the floor region so grooves stop where the
+    # flat floor meets the wall.
+    #
+    # CLIP ONLY APPLIES TO ENGRAVE. For emboss the bars are raised ON TOP of
+    # the floor - a bar reaching the wall just merges into it harmlessly, so
+    # emboss is left unclipped (clipping would wrongly chop raised bars).
+    #
+    # The clip boundary is DRAFTED at the roster draft angle so the groove's
+    # end wall tapers like its side walls (release-friendly), not a vertical
+    # cliff: the boundary is offset further inward as the groove deepens.
+    if (mode == "engrave" and floor_inset is not None
+            and floor_inset >= 0.0):
+        clip = None
+        try:
+            flat_info = _chamfer_get_flat_outline(parent_cavity_outline)
+            if flat_info is not None:
+                flat_edges, fcx, fcy = flat_info[0], flat_info[1], flat_info[2]
+                rtan = math.tan(math.radians(angle_deg))
+                extra = depth * rtan          # extra inset at groove bottom
+                # span just beyond the groove range for a clean common()
+                r_top_clip = r_floor + 1.0
+                r_bot_clip = r_floor - depth - 1.0
+                # inset(r) follows the draft line through
+                # (r_floor, floor_inset) and (r_floor-depth, floor_inset+extra)
+                inset_top = floor_inset + (r_floor - r_top_clip) / depth * extra
+                inset_bot = floor_inset + (r_floor - r_bot_clip) / depth * extra
+
+                def _floor_wire(inset):
+                    if inset > 1e-6:
+                        return _cham_offset_outline(
+                            flat_edges, fcx, fcy, inset)
+                    return Part.Wire(flat_edges)
+
+                ring_top = _cham_mkring(_floor_wire(inset_top), r_top_clip,
+                                        theta_per_x, y_per_y,
+                                        x_origin, y_origin)
+                ring_bot = _cham_mkring(_floor_wire(inset_bot), r_bot_clip,
+                                        theta_per_x, y_per_y,
+                                        x_origin, y_origin)
+                # Build the clip as a CAPPED solid: loft the side walls as a
+                # shell, then add the two ring faces as caps and sew. A plain
+                # makeLoft(solid=True) here leaves the ends open (invalid
+                # solid), which the validity guard below would then reject -
+                # skipping the clip entirely (grooves tunnel under the wall).
+                clip = None
+                try:
+                    side = Part.makeLoft(
+                        [ring_bot, ring_top], False, False, False)
+                    cap_bot = Part.Face(ring_bot)
+                    cap_top = Part.Face(ring_top)
+                    cf = list(side.Faces) + [cap_bot, cap_top]
+                    cc = Part.Compound(cf).copy()
+                    cc.sewShape(0.01)
+                    if cc.Shells:
+                        clip = Part.Solid(cc.Shells[0])
+                        if clip.Volume < 0:
+                            try:
+                                clip = clip.reversed()
+                            except Exception:
+                                pass
+                        try:
+                            clip = clip.removeSplitter()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: roster clip capped-solid build "
+                        "failed: {0}\n".format(exc))
+                    clip = None
+                # Fallback: if capping failed, try the plain solid loft and
+                # heal it; if STILL invalid we will use it anyway (common()
+                # tolerates it - matches the proven standalone behaviour).
+                if clip is None or not clip.isValid():
+                    try:
+                        raw = Part.makeLoft(
+                            [ring_bot, ring_top], True, False, False)
+                        try:
+                            raw = raw.removeSplitter()
+                        except Exception:
+                            pass
+                        if clip is None or (raw is not None
+                                            and raw.Volume > 1e-6):
+                            clip = raw
+                    except Exception:
+                        pass
+                FreeCAD.Console.PrintMessage(
+                    "RotaryMoulder: roster clip prism valid={0} vol={1:.2f}\n"
+                    .format(clip.isValid() if clip is not None else False,
+                            clip.Volume if clip is not None else 0.0))
+            else:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster clip - flat outline is None "
+                    "(no clip)\n")
+        except Exception as exc:
+            FreeCAD.Console.PrintWarning(
+                "RotaryMoulder: roster floor clip build failed: {0}; "
+                "bars left unclipped\n".format(exc))
+            clip = None
+
+        # Use the clip if we have one with positive volume. We do NOT
+        # require isValid(): the proven standalone used an open-ended (and
+        # technically invalid) clip prism with common() and produced the
+        # correct result - common() tolerates it. Requiring validity here
+        # was skipping the clip entirely and letting grooves tunnel under
+        # the wall.
+        if clip is not None and clip.Volume > 1e-6:
+            clipped = []
+            for bar, is_hole in bars:
+                try:
+                    cb = bar.common(clip)
+                    if cb is not None and abs(cb.Volume) > 1e-6:
+                        try:
+                            cb = cb.removeSplitter()
+                        except Exception:
+                            pass
+                        # common() may yield a compound; keep solids
+                        if cb.Solids:
+                            for s in cb.Solids:
+                                if s.isValid() and abs(s.Volume) > 1e-6:
+                                    clipped.append((s, is_hole))
+                        elif cb.isValid():
+                            clipped.append((cb, is_hole))
+                    else:
+                        # bar entirely outside floor -> drop it
+                        FreeCAD.Console.PrintMessage(
+                            "RotaryMoulder: roster bar clipped to nothing "
+                            "(outside floor)\n")
+                except Exception as exc:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: roster clip failed for a bar: "
+                        "{0}; keeping unclipped\n".format(exc))
+                    clipped.append((bar, is_hole))
+            if clipped:
+                bars = clipped
+                FreeCAD.Console.PrintMessage(
+                    "RotaryMoulder: clipped roster to floor footprint "
+                    "({0} bar solid(s))\n".format(len(bars)))
+
+    FreeCAD.Console.PrintMessage(
+        "RotaryMoulder: built {0} roster bar(s)\n".format(len(bars)))
+    return bars
+
+
 def build_docker_pins(outline_obj, drum_obj, parent_cavity_floor_radius,
                       tip_diameter, angle_deg,
                       parent_cavity_outline=None, pin_height=None):
@@ -1666,6 +2044,91 @@ def build_docker_pins(outline_obj, drum_obj, parent_cavity_floor_radius,
                 .format(sx, sy, exc))
 
     return pins
+
+
+def _faces_from_edge_soup(shape):
+    """Resolve a planar set of edges that may cross each other (e.g. a
+    roster / grid sketch drawn as overlapping bars or crossing lines)
+    into proper faces with holes.
+
+    A normal sketch of separate closed outlines already yields
+    shape.Faces, and this helper is NOT used for those. It is only a
+    fallback for self-intersecting / overlapping edge sets where
+    shape.Faces is empty - the grid bars cross mid-span, so OCC cannot
+    form faces directly.
+
+    Strategy (each step guarded; returns [] if nothing works):
+      1. Split all edges at their mutual intersections (generalFuse on
+         the edges) so no edge crosses another mid-span.
+      2. Connect the split edges into closed wires.
+      3. Build faces from the wires with FaceMakerBullseye, which
+         correctly handles nested/!overlapping regions and holes.
+    Returns a list of Part.Face, or [] on failure.
+    """
+    try:
+        edges = list(getattr(shape, "Edges", []))
+        if not edges:
+            return []
+
+        # Step 1: split edges at mutual crossings.
+        split_edges = edges
+        try:
+            comp = Part.Compound(edges)
+            fused, _map = comp.generalFuse([])
+            if getattr(fused, "Edges", None):
+                split_edges = list(fused.Edges)
+        except Exception:
+            # generalFuse on a bare edge compound can fail; fall back to
+            # pairwise sectioning so crossings still get split.
+            try:
+                new_edges = []
+                for i, e in enumerate(edges):
+                    pieces = [e]
+                    for j, o in enumerate(edges):
+                        if i == j:
+                            continue
+                        next_pieces = []
+                        for pc in pieces:
+                            try:
+                                cut = pc.cut(o)
+                                next_pieces.extend(cut.Edges if cut.Edges
+                                                   else [pc])
+                            except Exception:
+                                next_pieces.append(pc)
+                        pieces = next_pieces
+                    new_edges.extend(pieces)
+                if new_edges:
+                    split_edges = new_edges
+            except Exception:
+                split_edges = edges
+
+        # Step 2: connect split edges into wires.
+        try:
+            wires = Part.sortEdges(split_edges)
+            wires = [Part.Wire(ws) for ws in wires]
+        except Exception:
+            try:
+                wires = [Part.Wire(split_edges)]
+            except Exception:
+                wires = []
+        closed = [w for w in wires if w.isClosed()]
+        if not closed:
+            return []
+
+        # Step 3: build faces (FaceMakerBullseye handles nesting/holes).
+        for maker in ("Part::FaceMakerBullseye", "Part::FaceMakerCheese"):
+            try:
+                f = Part.makeFace(closed, maker)
+                if f is not None and f.Faces and f.Area > 1e-6:
+                    return list(f.Faces)
+            except Exception:
+                continue
+        return []
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "RotaryMoulder: edge-soup face resolution failed: {0}\n"
+            .format(exc))
+        return []
 
 
 def build_detail_solid(outline_obj, drum_obj, parent_cavity_floor_radius,
@@ -2365,7 +2828,8 @@ def _apply_detail_chunks(result, detail_chunks, mode, placement=None):
 
 def _apply_cavity_with_details(result, drum_obj, cavity_chunk,
                                 cavity_depth, details_list,
-                                cavity_outline=None, dockers_list=None):
+                                cavity_outline=None, dockers_list=None,
+                                floor_inset=None):
     # The wall-to-floor chamfer is now baked into the cavity chunk itself
     # (see build_cavity_solid / _chamfer_frustum_from_projected_wire),
     # controlled by the cavity's ChamferDistance. The old post-hoc
@@ -2382,9 +2846,30 @@ def _apply_cavity_with_details(result, drum_obj, cavity_chunk,
     for det in (details_list or []):
         if det is None or not hasattr(det, "Proxy"):
             continue
-        if getattr(det.Proxy, "Type", "") != "RotaryMoulder::CavityDetail":
-            continue
+        det_type = getattr(det.Proxy, "Type", "")
         if det.Outline is None:
+            continue
+        if det_type == "RotaryMoulder::CavityRoster":
+            try:
+                roster_chunks = build_roster_bars(
+                    det.Outline, drum_obj,
+                    parent_cavity_floor_radius=R_floor,
+                    bar_width=float(det.BarWidth),
+                    depth=float(det.Depth),
+                    angle_deg=float(det.DraftAngle),
+                    mode=str(det.Mode),
+                    parent_cavity_outline=cavity_outline,
+                    floor_inset=floor_inset,
+                )
+            except (ValueError, RuntimeError) as exc:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: roster '{0}' failed: {1}\n".format(
+                        det.Label, exc))
+                continue
+            result = _apply_detail_chunks(
+                result, roster_chunks, str(det.Mode))
+            continue
+        if det_type != "RotaryMoulder::CavityDetail":
             continue
         try:
             detail_chunks = build_detail_solid(
@@ -2431,7 +2916,8 @@ def _apply_cavity_with_details(result, drum_obj, cavity_chunk,
 
 def _apply_cup_with_details(cup_solid, drum_obj, cup_floor_radius,
                             details_list, cup_outline=None,
-                            dockers_list=None, pin_height=None):
+                            dockers_list=None, pin_height=None,
+                            floor_inset=None):
     """Apply details and docker pins to a CUTTING CUP solid.
 
     Mirrors _apply_cavity_with_details, but the cup IS the result (we do
@@ -2445,9 +2931,30 @@ def _apply_cup_with_details(cup_solid, drum_obj, cup_floor_radius,
     for det in (details_list or []):
         if det is None or not hasattr(det, "Proxy"):
             continue
-        if getattr(det.Proxy, "Type", "") != "RotaryMoulder::CavityDetail":
-            continue
+        det_type = getattr(det.Proxy, "Type", "")
         if det.Outline is None:
+            continue
+        if det_type == "RotaryMoulder::CavityRoster":
+            try:
+                roster_chunks = build_roster_bars(
+                    det.Outline, drum_obj,
+                    parent_cavity_floor_radius=cup_floor_radius,
+                    bar_width=float(det.BarWidth),
+                    depth=float(det.Depth),
+                    angle_deg=float(det.DraftAngle),
+                    mode=str(det.Mode),
+                    parent_cavity_outline=cup_outline,
+                    floor_inset=floor_inset,
+                )
+            except (ValueError, RuntimeError) as exc:
+                FreeCAD.Console.PrintWarning(
+                    "RotaryMoulder: cup roster '{0}' failed: {1}\n".format(
+                        det.Label, exc))
+                continue
+            result = _apply_detail_chunks(
+                result, roster_chunks, str(det.Mode))
+            continue
+        if det_type != "RotaryMoulder::CavityDetail":
             continue
         try:
             detail_chunks = build_detail_solid(
@@ -2589,12 +3096,23 @@ class DraftedCavity:
             FreeCAD.Console.PrintError(
                 "RotaryMoulder: cavity build failed: {0}\n".format(exc))
             return
+        # Floor-edge inset for clipping engraved rosters: the cavity floor
+        # is the outline drafted inward by depth*tan(draft), plus the
+        # chamfer band. Mirrors the cavity wall geometry.
+        _cd = float(obj.Depth)
+        _ca = math.tan(math.radians(float(obj.DraftAngle)))
+        _cch = float(getattr(obj, "ChamferDistance", 0.0))
+        if _cch > 1e-9 and _cch < _cd:
+            cav_floor_inset = (_cd - _cch) * _ca + _cch
+        else:
+            cav_floor_inset = _cd * _ca
         result = _apply_cavity_with_details(
             drum_shape, obj.Drum, chunk,
             cavity_depth=float(obj.Depth),
             details_list=list(getattr(obj, "Details", []) or []),
             cavity_outline=obj.Outline,
             dockers_list=list(getattr(obj, "Dockers", []) or []),
+            floor_inset=cav_floor_inset,
         )
         obj.Shape = result
 
@@ -2692,12 +3210,25 @@ class CuttingCup:
         # solid floor band), before any optional fuse to the drum.
         R_outer = float(obj.Drum.Diameter) / 2.0
         cup_floor_radius = R_outer + float(getattr(obj, "FloorThickness", 0.0))
+        # Floor-edge inset (where the flat floor meets the wall) for
+        # clipping engraved rosters - matches build_cutting_cup_solid's
+        # inner_fl_off.
+        _ct = float(obj.CookieThickness)
+        _ch = float(getattr(obj, "ChamferDistance", 0.0))
+        _td = math.tan(math.radians(float(obj.DraftAngle)))
+        _R_edge = cup_floor_radius + _ct
+        if _ch > 1e-9 and _ch < _ct:
+            _R_TOPCH = cup_floor_radius + _ch
+            cup_floor_inset = (_R_edge - _R_TOPCH) * _td + _ch
+        else:
+            cup_floor_inset = (_R_edge - cup_floor_radius) * _td
         cup = _apply_cup_with_details(
             cup, obj.Drum, cup_floor_radius,
             details_list=list(getattr(obj, "Details", []) or []),
             cup_outline=obj.Outline,
             dockers_list=list(getattr(obj, "Dockers", []) or []),
             pin_height=float(obj.CookieThickness),
+            floor_inset=cup_floor_inset,
         )
 
         if bool(getattr(obj, "FuseToDrum", False)):
@@ -2816,6 +3347,52 @@ class CavityDockersViewProvider:
     def __setstate__(self, _state): return None
 
 
+class CavityRoster:
+    """A roster / lattice detail built from a CENTERLINE sketch.
+
+    Each line in the Outline sketch becomes a bar with a trapezoidal
+    cross-section (BarWidth at the base, narrowing by the draft toward
+    the top, Depth tall). Bars are cylinder-conformal so they blend
+    cleanly at crossings. Applied to a Cavity, CavityPattern, or
+    CuttingCup floor like other details:
+      * Mode = emboss -> raised bars
+      * Mode = engrave -> recessed grooves
+    Draw the roster as simple centerlines (a closed boundary wire, if
+    present, is ignored - only the bar lines are used).
+    """
+    Type = "RotaryMoulder::CavityRoster"
+
+    def __init__(self, obj):
+        obj.addProperty("App::PropertyLink", "Outline", "Roster",
+                        "Centerline sketch (each line = one bar)")
+        obj.addProperty("App::PropertyLength", "BarWidth", "Roster",
+                        "Bar base width (mm)").BarWidth = 1.8
+        obj.addProperty("App::PropertyLength", "Depth", "Roster",
+                        "Bar height from floor (mm)").Depth = 0.9
+        obj.addProperty("App::PropertyAngle", "DraftAngle", "Roster",
+                        "Bar side draft angle").DraftAngle = 16.0
+        obj.addProperty("App::PropertyEnumeration", "Mode", "Roster",
+                        "engrave or emboss")
+        obj.Mode = ["engrave", "emboss"]
+        obj.Mode = "emboss"
+        obj.Proxy = self
+
+    def execute(self, obj):
+        # Applied by the parent Cavity/Pattern/Cup, not standalone.
+        obj.Shape = Part.Compound([])
+
+
+class CavityRosterViewProvider:
+    def __init__(self, vobj): vobj.Proxy = self
+    def attach(self, vobj): self.Object = vobj.Object
+    def claimChildren(self):
+        obj = getattr(self, "Object", None)
+        return [obj.Outline] if obj is not None and obj.Outline else []
+    def getIcon(self): return ""
+    def __getstate__(self): return None
+    def __setstate__(self, _state): return None
+
+
 class CavityPattern:
     Type = "RotaryMoulder::CavityPattern"
 
@@ -2920,16 +3497,42 @@ class CavityPattern:
         offset = float(obj.AxialOffset)
         result = obj.Drum.Shape.copy()
         R_floor = float(obj.Drum.Diameter) / 2.0 - depth
+        # Floor-edge inset for clipping engraved rosters (see DraftedCavity).
+        _ca = math.tan(math.radians(angle))
+        if chamfer > 1e-9 and chamfer < depth:
+            cav_floor_inset = (depth - chamfer) * _ca + chamfer
+        else:
+            cav_floor_inset = depth * _ca
 
         # Build all detail chunks ONCE (at origin)
         all_detail_chunk_lists = []
         for det in all_details:
             if det is None or not hasattr(det, "Proxy"):
                 all_detail_chunk_lists.append(None); continue
-            if getattr(det.Proxy, "Type", "") != \
-                    "RotaryMoulder::CavityDetail":
-                all_detail_chunk_lists.append(None); continue
+            det_type = getattr(det.Proxy, "Type", "")
             if det.Outline is None:
+                all_detail_chunk_lists.append(None); continue
+            if det_type == "RotaryMoulder::CavityRoster":
+                try:
+                    dcs = build_roster_bars(
+                        det.Outline, obj.Drum,
+                        parent_cavity_floor_radius=R_floor,
+                        bar_width=float(det.BarWidth),
+                        depth=float(det.Depth),
+                        angle_deg=float(det.DraftAngle),
+                        mode=str(det.Mode),
+                        parent_cavity_outline=outline,
+                        floor_inset=cav_floor_inset,
+                    )
+                    all_detail_chunk_lists.append(
+                        (dcs, str(det.Mode), det.Label))
+                except (ValueError, RuntimeError) as exc:
+                    FreeCAD.Console.PrintWarning(
+                        "RotaryMoulder: roster '{0}' failed: {1}\n".format(
+                            det.Label, exc))
+                    all_detail_chunk_lists.append(None)
+                continue
+            if det_type != "RotaryMoulder::CavityDetail":
                 all_detail_chunk_lists.append(None); continue
             try:
                 dcs = build_detail_solid(
@@ -3136,12 +3739,22 @@ class CuttingCupPattern:
 
         R_outer = float(drum_obj.Diameter) / 2.0
         cup_floor_radius = R_outer + float(getattr(src, "FloorThickness", 0.0))
+        _ct = float(src.CookieThickness)
+        _ch = float(getattr(src, "ChamferDistance", 0.0))
+        _td = math.tan(math.radians(float(src.DraftAngle)))
+        _R_edge = cup_floor_radius + _ct
+        if _ch > 1e-9 and _ch < _ct:
+            _R_TOPCH = cup_floor_radius + _ch
+            cup_floor_inset = (_R_edge - _R_TOPCH) * _td + _ch
+        else:
+            cup_floor_inset = (_R_edge - cup_floor_radius) * _td
         master = _apply_cup_with_details(
             master, drum_obj, cup_floor_radius,
             details_list=list(getattr(src, "Details", []) or []),
             cup_outline=src.Outline,
             dockers_list=list(getattr(src, "Dockers", []) or []),
             pin_height=float(src.CookieThickness),
+            floor_inset=cup_floor_inset,
         )
 
         count_a = max(1, int(obj.CountAround))
@@ -3296,6 +3909,32 @@ def make_detail(parent, outline, depth=1.0, angle=10.0,
     if FreeCAD.GuiUp:
         CavityDetailViewProvider(obj.ViewObject)
     details = list(parent.Details or [])
+    details.append(obj)
+    parent.Details = details
+    doc.recompute()
+    return obj
+
+
+def make_roster(parent, outline, bar_width=1.8, depth=0.9, angle=16.0,
+                mode="emboss"):
+    """Add a CavityRoster (lattice of bars) child to a Cavity, CuttingCup,
+    or CavityPattern. `outline` is a CENTERLINE sketch - each line becomes
+    a bar. Rosters live in the parent's Details list (a roster is a kind
+    of detail), so they are applied wherever details are.
+    """
+    doc = parent.Document
+    obj = doc.addObject("Part::FeaturePython", "CavityRoster")
+    CavityRoster(obj)
+    # No back-link to parent (avoids the DAG cycle); the parent
+    # forward-links via its Details list.
+    obj.Outline = outline
+    obj.BarWidth = bar_width
+    obj.Depth = depth
+    obj.DraftAngle = angle
+    obj.Mode = mode
+    if FreeCAD.GuiUp:
+        CavityRosterViewProvider(obj.ViewObject)
+    details = list(getattr(parent, "Details", []) or [])
     details.append(obj)
     parent.Details = details
     doc.recompute()
