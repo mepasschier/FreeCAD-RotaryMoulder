@@ -3,6 +3,36 @@
 All notable changes to the Rotary Moulder Workbench are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-05-27
+
+### Added
+- **Roster (lattice) detail.** A new `CavityRoster` object turns a
+  centerline sketch into a lattice of bars on the cavity/cup floor - each
+  line becomes one bar. Properties: `BarWidth`, `Depth`, `DraftAngle`,
+  and `Mode` (emboss = raised bars, engrave = recessed grooves). Bars
+  have a drafted trapezoidal cross-section and are built cylinder-
+  conformally so they blend cleanly where they cross, with no twist.
+  Draw the roster as simple centerlines (a closed boundary wire in the
+  sketch, if present, is ignored - only the bar lines are used).
+- **Add Roster command + toolbar button** (with icon). Select a cavity,
+  cavity pattern, or cutting cup together with a centerline sketch, then
+  run the command and set bar width / depth / draft / mode in the dialog.
+- **Rosters work everywhere details do:** on regular cavities, cutting
+  cups, and their patterns, in both emboss and engrave modes.
+- **Engraved rosters are clipped to the flat floor.** An engraved groove
+  that reached the edge of the floor used to tunnel underneath the
+  drafted/chamfered wall, hollowing a cavity there. Engraved roster bars
+  are now automatically clipped to the floor footprint (where the flat
+  floor meets the wall), and the clipped end is itself drafted at the
+  roster draft angle so the groove closes off cleanly for release.
+  Embossed rosters are left unclipped (raised bars simply meet the wall).
+
+### Fixed
+- **Engraved letter/ShapeString details on regular cavities** could leave
+  a thin floor film under a glyph and drop part of the cavity floor. The
+  detail builder's fallback path was reverted to its proven behavior so
+  text engraves cleanly again.
+
 ## [1.2.1] - 2026-05-26
 
 ### Fixed
