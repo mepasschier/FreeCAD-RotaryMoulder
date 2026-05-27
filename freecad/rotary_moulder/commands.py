@@ -879,3 +879,97 @@ class _CupPatternDialog(QtGui.QDialog):
 FreeCADGui.addCommand(
     "RotaryMoulder_PatternCuttingCups", PatternCuttingCupsCommand()
 )
+
+
+# ---------------------------------------------------------------------------
+
+class AddRosterCommand:
+    """Add a roster / lattice detail to a cavity or cutting cup. Select the
+    cavity/cup and a CENTERLINE sketch (each line becomes a bar)."""
+
+    def GetResources(self):
+        return {
+            "Pixmap": _icon("CavityRoster.svg"),
+            "MenuText": "Add Roster (Lattice) to Cavity / Cup",
+            "ToolTip": "Select a cavity, pattern, or cutting cup and a "
+                       "centerline sketch (each line = one bar), then run "
+                       "this to add an embossed or engraved lattice of bars.",
+        }
+
+    def IsActive(self):
+        return FreeCAD.ActiveDocument is not None
+
+    def Activated(self):
+        cavity, outline = _select_cavity_and_outline()
+        if cavity is None:
+            QtGui.QMessageBox.warning(
+                None, "Rotary Moulder",
+                "Select a Cavity, Pattern, or Cutting Cup together with a "
+                "centerline sketch for the roster bars."
+            )
+            return
+        if outline is None:
+            QtGui.QMessageBox.warning(
+                None, "Rotary Moulder",
+                "Select a centerline sketch (each line = one bar) along "
+                "with the cavity or cup."
+            )
+            return
+
+        dlg = _RosterDialog()
+        if dlg.exec_() != QtGui.QDialog.Accepted:
+            return
+        p = dlg.values()
+        geometry.make_roster(
+            cavity, outline,
+            bar_width=p["bar_width"],
+            depth=p["depth"],
+            angle=p["angle"],
+            mode=p["mode"],
+        )
+
+
+class _RosterDialog(QtGui.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Roster (Lattice) Detail")
+        layout = QtGui.QFormLayout(self)
+
+        self.bar_width = QtGui.QDoubleSpinBox()
+        self.bar_width.setRange(0.1, 50.0)
+        self.bar_width.setDecimals(2)
+        self.bar_width.setValue(1.8)
+        layout.addRow("Bar width (mm):", self.bar_width)
+
+        self.depth = QtGui.QDoubleSpinBox()
+        self.depth.setRange(0.1, 50.0)
+        self.depth.setDecimals(2)
+        self.depth.setValue(0.9)
+        layout.addRow("Depth / height (mm):", self.depth)
+
+        self.angle = QtGui.QDoubleSpinBox()
+        self.angle.setRange(0.0, 60.0)
+        self.angle.setDecimals(2)
+        self.angle.setValue(16.0)
+        layout.addRow("Draft angle (deg):", self.angle)
+
+        self.mode = QtGui.QComboBox()
+        self.mode.addItems(["emboss", "engrave"])
+        layout.addRow("Mode:", self.mode)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def values(self):
+        return {
+            "bar_width": self.bar_width.value(),
+            "depth": self.depth.value(),
+            "angle": self.angle.value(),
+            "mode": self.mode.currentText(),
+        }
+
+
+FreeCADGui.addCommand("RotaryMoulder_AddRoster", AddRosterCommand())
