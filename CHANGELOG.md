@@ -3,6 +3,16 @@
 All notable changes to the Rotary Moulder Workbench are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-06-05
+
+### Fixed
+- `package.xml`: removed malformed elements (`<name>`/`<description>`
+  inside `<workbench>`, the `<tags>` wrapper, and the non-schema
+  `<dependencies>` block). Dependencies are now declared inside
+  `<workbench>` with `<freecadmin>` and `<depend>`. Description
+  collapsed to a single line; tags reduced to three. Required for
+  Addon Index compliance (issue #50).
+
 ## [1.3.0] - 2026-05-27
 
 ### Added
