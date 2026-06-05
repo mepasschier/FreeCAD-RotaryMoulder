@@ -3,7 +3,7 @@
 import os
 import FreeCAD
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # Find the addon root. This file lives at <addon>/freecad/rotary_moulder/__init__.py
 # so two parents up gets us to the addon root, regardless of whether the
